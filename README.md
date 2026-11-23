@@ -79,11 +79,11 @@ Deployment: supports **Local, Cloud, and Hybrid**, with a Control Plane / Execut
 
 | Phase | Focus | Deliverable | Status |
 |---|---|---|---|
-| 00 | Project Foundation | Project Specification | Draft |
-| 01 | Supreme Architecture | Architecture Specification | Draft |
-| 02 | Authority & Governance | Governance Engine | In progress |
+| 00 | Project Foundation | Project Specification | Complete (validated) |
+| 01 | Supreme Architecture | Architecture Specification | Complete (validated) |
+| 02 | Authority & Governance | Governance Engine | Complete (validated) |
 | 03 | Core Foundation | Central Control | Complete (MVP) |
-| 04 | AI Infrastructure | Model Intelligence | Partial |
+| 04 | AI Infrastructure | Model Intelligence | Complete (validated) |
 | 05 | AI Engine | Inference Engine | Partial |
 | 06 | Agent Intelligence | Agent Engine | Planned |
 | 07 | Memory & Knowledge | Knowledge Platform | Planned |
@@ -101,6 +101,9 @@ Deployment: supports **Local, Cloud, and Hybrid**, with a Control Plane / Execut
 | [`NEXUS_Master_Blueprint_EN.md`](NEXUS_Master_Blueprint_EN.md) | Full master blueprint (English), covering all 13 sections |
 | [`docs/GOVERNANCE.md`](docs/GOVERNANCE.md) | Command policy and approval enforcement MVP |
 | [`docs/AI_ENGINE.md`](docs/AI_ENGINE.md) | AI inference, provider setup, registry, and authorization guide |
+| [`docs/PHASE_00_PROJECT_FOUNDATION.md`](docs/PHASE_00_PROJECT_FOUNDATION.md) | Phase 00 specification, implementation, acceptance criteria, and test evidence |
+| [`docs/PHASE_01_SUPREME_ARCHITECTURE.md`](docs/PHASE_01_SUPREME_ARCHITECTURE.md) | Phase 01 three-tier architecture, boundaries, flows, deployment, and acceptance criteria |
+| [`docs/PHASE_02_AUTHORITY_AND_GOVERNANCE.md`](docs/PHASE_02_AUTHORITY_AND_GOVERNANCE.md) | Phase 02 authority model, governance decisions, audit evidence, and acceptance criteria |
 | [`examples/nexus-api.http`](examples/nexus-api.http) | Sample model registry and inference requests |
 | [`examples/seed_models.json`](examples/seed_models.json) | Disabled placeholder models for optional development seeding |
 
@@ -123,9 +126,9 @@ The initial implementation provides:
 - Tenant-scoped audit events
 - Emergency stop activation and clearing
 - Tenant-scoped command policies with fail-closed defaults and payload-key approval rules
-- Separate creator/approver enforcement and policy audit snapshots
+- Separate creator/approver enforcement, immutable policy version history, and command decision snapshots
 - Tenant-scoped system registry with owner-managed lifecycle status
-- Tenant-scoped task lifecycle and emergency-stop enforcement
+- Tenant-scoped manual task lifecycle and durable AI inference worker queue
 - Event journal with source validation, filters, and audit records
 - Tenant-scoped configuration store for non-secret values
 - Tenant-scoped encrypted secret store with metadata-only API responses
@@ -138,11 +141,50 @@ The initial implementation provides:
 - Docker and Docker Compose configuration
 - Pytest API coverage
 
-The task API manages lifecycle state only; it does not execute work in a
-background worker. The event journal stores and filters events but does not
-dispatch them through a broker. Tenant configuration values are stored for
-management but are not automatically applied to runtime settings; this store is
-not for credentials or other secrets. Secret writes require
+## Deployment security
+
+Production deployments must set:
+
+- `NEXUS_ENVIRONMENT=production`
+- `NEXUS_DATABASE_URL`
+- `NEXUS_JWT_SECRET` with at least 32 characters
+- `NEXUS_JWT_ISSUER`
+- `NEXUS_JWT_AUDIENCE`
+- `NEXUS_SECRET_ENCRYPTION_KEY`
+
+The application refuses to start in production when the JWT configuration is
+missing or uses the development JWT secret. Production JWTs must include
+`exp`, `iss`, and `aud`. Docker Compose requires `POSTGRES_PASSWORD` and
+`NEXUS_JWT_SECRET` from the deployment environment.
+
+Database schema changes are managed by Alembic:
+
+```bash
+alembic upgrade head
+alembic downgrade base
+```
+
+The API container and worker both apply migrations before startup. The legacy
+development startup path may create missing SQLite tables, but production
+startup does not use `create_all()`.
+
+Use `/health/live` for process liveness and `/health/ready` for database
+readiness. `/health` remains available as a compatibility endpoint.
+
+Manual tasks continue to use the task lifecycle endpoints. Tasks created with
+`work_type: "ai.inference"` are claimed by the separate worker process, routed
+to an enabled chat model for the same tenant, and completed with a JSON
+`InferenceResponse` in the task's `result`. Configure an enabled chat model and
+`NEXUS_AI_API_KEY` before submitting inference tasks. The worker uses database
+leases and retries transient provider failures up to three attempts; processing
+is at-least-once, so a provider timeout can cause a repeated request. Emergency
+stop prevents new tasks from being claimed. Inference prompts and results are
+stored unencrypted in the application database; results are visible through
+tenant-scoped task reads, so do not include secret values. The event journal
+stores and filters events but does not dispatch them through a broker. Tenant
+configuration values are stored for management but are not automatically
+applied to runtime settings; this store is not for credentials or other
+secrets. Secret writes require
 `NEXUS_SECRET_ENCRYPTION_KEY`; values are encrypted before persistence and are
 available to application code through the tenant-scoped resolver, not through
 the HTTP API. The encryption key is deployment-managed and not stored in the
@@ -156,6 +198,16 @@ python3 -m venv .venv
 pip install -e ".[test]"
 uvicorn app.main:app --reload
 ```
+
+For local background execution, run the worker in a second terminal:
+
+```bash
+python -m app.worker
+```
+
+Docker Compose starts the worker alongside the API. To enqueue an inference
+task, post a task with `work_type: "ai.inference"` and `work_payload` matching
+the `/api/v1/ai/infer` request body.
 
 Run tests:
 

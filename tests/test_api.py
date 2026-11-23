@@ -1,8 +1,17 @@
+from datetime import datetime, timedelta, timezone
+import httpx
+
 from tests.conftest import auth_headers
-from app.ai.providers import InferenceResult, OpenAICompatibleProvider
+from app.ai.providers import (
+    InferenceResult,
+    OpenAICompatibleProvider,
+    ProviderTimeoutError,
+)
 from app.api.routes import get_inference_provider
 from app.core.config import Settings
 from app.main import app
+from app.models import CommandPolicyVersion, TaskWorkItem
+from app.worker import process_next_work_item
 
 
 class StubInferenceProvider:
@@ -21,6 +30,16 @@ def test_health(client):
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json() == {"status": "healthy"}
+
+
+def test_liveness_and_readiness(client):
+    live = client.get("/health/live")
+    assert live.status_code == 200
+    assert live.json() == {"status": "alive"}
+
+    ready = client.get("/health/ready")
+    assert ready.status_code == 200
+    assert ready.json() == {"status": "ready"}
 
 
 def test_command_lifecycle_and_audit(client):
@@ -272,6 +291,108 @@ def test_only_owner_can_manage_command_policies(client):
         headers=auth_headers(role="viewer", tenant_id="tenant-a"),
     )
     assert viewer_read.status_code == 403
+
+
+def test_command_policy_versions_are_immutable_tenant_scoped_and_audited(client):
+    owner_headers = auth_headers(role="owner", tenant_id="tenant-a")
+    created = client.post(
+        "/api/v1/policies/commands",
+        headers=owner_headers,
+        json={"command_type": "versioned", "require_approval": True},
+    )
+    assert created.status_code == 201
+    policy = created.json()
+    assert policy["version"] == 1
+
+    updated = client.patch(
+        f"/api/v1/policies/commands/{policy['id']}",
+        headers=owner_headers,
+        json={"require_approval": False},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["version"] == 2
+
+    no_op = client.patch(
+        f"/api/v1/policies/commands/{policy['id']}",
+        headers=owner_headers,
+        json={"require_approval": False},
+    )
+    assert no_op.status_code == 200
+    assert no_op.json()["version"] == 2
+
+    versions = client.get(
+        f"/api/v1/policies/commands/{policy['id']}/versions",
+        headers=owner_headers,
+    )
+    assert versions.status_code == 200
+    assert [item["version"] for item in versions.json()] == [1, 2]
+    assert versions.json()[0]["snapshot"]["require_approval"] is True
+    assert versions.json()[1]["snapshot"]["require_approval"] is False
+    assert versions.json()[1]["changed_by"] == "test-user"
+
+    command = client.post(
+        "/api/v1/commands",
+        headers=auth_headers(role="operator", tenant_id="tenant-a"),
+        json={"type": "versioned", "payload": {}, "require_approval": False},
+    )
+    assert command.status_code == 201
+    assert command.json()["status"] == "APPROVED"
+
+    audit = client.get(
+        "/api/v1/audit",
+        headers=auth_headers(role="operator", tenant_id="tenant-a"),
+    )
+    creation_event = next(
+        event
+        for event in audit.json()
+        if event["resource_id"] == command.json()["id"]
+        and event["action"] == "COMMAND_CREATED"
+    )
+    assert creation_event["detail"]["policy_version"] == 2
+    assert creation_event["detail"]["policy_snapshot"]["require_approval"] is False
+
+    cross_tenant = client.get(
+        f"/api/v1/policies/commands/{policy['id']}/versions",
+        headers=auth_headers(role="owner", tenant_id="tenant-b"),
+    )
+    assert cross_tenant.status_code == 404
+
+
+def test_legacy_policy_gets_baseline_version_before_update(client, db_session):
+    headers = auth_headers(role="owner", tenant_id="tenant-a")
+    created = client.post(
+        "/api/v1/policies/commands",
+        headers=headers,
+        json={"command_type": "legacy", "require_approval": True},
+    )
+    policy_id = created.json()["id"]
+
+    db_session.query(CommandPolicyVersion).delete()
+    db_session.commit()
+
+    legacy_history = client.get(
+        f"/api/v1/policies/commands/{policy_id}/versions",
+        headers=headers,
+    )
+    assert legacy_history.status_code == 200
+    assert [item["version"] for item in legacy_history.json()] == [1]
+    assert legacy_history.json()[0]["snapshot"]["require_approval"] is True
+
+    updated = client.patch(
+        f"/api/v1/policies/commands/{policy_id}",
+        headers=headers,
+        json={"require_approval": False},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["version"] == 2
+
+    history = client.get(
+        f"/api/v1/policies/commands/{policy_id}/versions",
+        headers=headers,
+    )
+    assert [item["version"] for item in history.json()] == [1, 2]
+    assert history.json()[0]["snapshot"]["require_approval"] is True
+    assert history.json()[1]["snapshot"]["require_approval"] is False
 
 
 def test_disabled_auto_approval_policy_fails_closed(client):
@@ -533,6 +654,208 @@ def test_task_lifecycle_and_audit(client):
     audit = client.get("/api/v1/audit", headers=headers)
     actions = {event["action"] for event in audit.json()}
     assert {"TASK_CREATED", "TASK_STARTED", "TASK_COMPLETED"} <= actions
+
+
+def test_ai_inference_task_runs_through_background_worker(client, db_session):
+    headers = auth_headers(role="operator", tenant_id="tenant-a")
+    model = client.post(
+        "/api/v1/models",
+        headers=headers,
+        json={
+            "name": "worker-chat",
+            "provider": "openai-compatible",
+            "model_identifier": "test-model",
+            "capabilities": ["chat"],
+        },
+    )
+    assert model.status_code == 201
+
+    prompt = "Summarize this in a sentence."
+    created = client.post(
+        "/api/v1/tasks",
+        headers=headers,
+        json={
+            "title": "Background inference",
+            "work_type": "ai.inference",
+            "work_payload": {
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.2,
+                "max_tokens": 64,
+                "ignored_extra": "not persisted",
+            },
+        },
+    )
+    assert created.status_code == 201
+    task = created.json()
+    assert task["work_type"] == "ai.inference"
+    assert task["status"] == "PENDING"
+    assert "work_payload" not in task
+    work_item = db_session.get(TaskWorkItem, task["id"])
+    assert work_item is not None
+    assert "ignored_extra" not in work_item.payload
+
+    assert process_next_work_item(
+        db_session,
+        worker_id="test-worker",
+        provider=StubInferenceProvider(),
+    )
+
+    completed = client.get(f"/api/v1/tasks/{task['id']}", headers=headers)
+    assert completed.status_code == 200
+    assert completed.json()["status"] == "COMPLETED"
+    assert completed.json()["finished_at"] is not None
+    assert '"content": "Hello from the model"' in completed.json()["result"]
+
+    worker_audit = client.get("/api/v1/audit", headers=headers).json()
+    task_details = [
+        event["detail"]
+        for event in worker_audit
+        if event["resource_id"] == task["id"]
+    ]
+    assert all(prompt not in str(detail) for detail in task_details)
+
+    rejected_manual_start = client.post(
+        f"/api/v1/tasks/{task['id']}/start",
+        headers=headers,
+    )
+    assert rejected_manual_start.status_code == 409
+
+
+def test_worker_retries_transient_inference_failure(client, db_session):
+    class FlakyProvider(StubInferenceProvider):
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise ProviderTimeoutError("provider timed out")
+            return super().generate(**kwargs)
+
+    headers = auth_headers(role="operator", tenant_id="tenant-a")
+    model = client.post(
+        "/api/v1/models",
+        headers=headers,
+        json={
+            "name": "retry-chat",
+            "provider": "openai-compatible",
+            "model_identifier": "test-model",
+            "capabilities": ["chat"],
+        },
+    )
+    assert model.status_code == 201
+    created = client.post(
+        "/api/v1/tasks",
+        headers=headers,
+        json={
+            "title": "Retry inference",
+            "work_type": "ai.inference",
+            "work_payload": {
+                "messages": [{"role": "user", "content": "Retry me"}],
+            },
+        },
+    )
+    assert created.status_code == 201
+    task_id = created.json()["id"]
+    provider = FlakyProvider()
+    now = datetime.now(timezone.utc)
+
+    assert process_next_work_item(
+        db_session,
+        worker_id="test-worker",
+        provider=provider,
+        now=now,
+    )
+    pending = client.get(f"/api/v1/tasks/{task_id}", headers=headers)
+    assert pending.json()["status"] == "IN_PROGRESS"
+    assert pending.json()["finished_at"] is None
+
+    assert process_next_work_item(
+        db_session,
+        worker_id="test-worker",
+        provider=provider,
+        now=now + timedelta(seconds=10),
+    )
+    completed = client.get(f"/api/v1/tasks/{task_id}", headers=headers)
+    assert completed.json()["status"] == "COMPLETED"
+    assert provider.calls == 2
+
+
+def test_worker_rejects_invalid_jobs_and_honors_emergency_stop(client, db_session):
+    operator_headers = auth_headers(role="operator", tenant_id="tenant-a")
+    invalid_requests = [
+        {"title": "Missing type", "work_payload": {}},
+        {"title": "Missing payload", "work_type": "ai.inference"},
+        {
+            "title": "Unsupported type",
+            "work_type": "shell.command",
+            "work_payload": {},
+        },
+        {
+            "title": "Invalid inference",
+            "work_type": "ai.inference",
+            "work_payload": {"messages": [{"role": "user"}]},
+        },
+    ]
+    for request in invalid_requests:
+        response = client.post(
+            "/api/v1/tasks",
+            headers=operator_headers,
+            json=request,
+        )
+        assert response.status_code == 422
+
+    created = client.post(
+        "/api/v1/tasks",
+        headers=operator_headers,
+        json={
+            "title": "Wait during emergency stop",
+            "work_type": "ai.inference",
+            "work_payload": {
+                "messages": [{"role": "user", "content": "Do not run yet"}],
+            },
+        },
+    )
+    assert created.status_code == 201
+
+    owner_headers = auth_headers(role="owner", tenant_id="tenant-a")
+    stopped = client.post("/api/v1/emergency-stop", headers=owner_headers)
+    assert stopped.status_code == 200
+    assert not process_next_work_item(
+        db_session,
+        worker_id="test-worker",
+        provider=StubInferenceProvider(),
+    )
+    pending = client.get(
+        f"/api/v1/tasks/{created.json()['id']}",
+        headers=operator_headers,
+    )
+    assert pending.json()["status"] == "PENDING"
+
+
+def test_cancelled_worker_task_is_not_executed(client, db_session):
+    headers = auth_headers(role="operator", tenant_id="tenant-a")
+    created = client.post(
+        "/api/v1/tasks",
+        headers=headers,
+        json={
+            "title": "Cancelled inference",
+            "work_type": "ai.inference",
+            "work_payload": {
+                "messages": [{"role": "user", "content": "Do not execute"}],
+            },
+        },
+    )
+    task_id = created.json()["id"]
+
+    cancelled = client.post(f"/api/v1/tasks/{task_id}/cancel", headers=headers)
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "CANCELLED"
+    assert not process_next_work_item(
+        db_session,
+        worker_id="test-worker",
+        provider=StubInferenceProvider(),
+    )
 
 
 def test_task_failure_and_cancellation_transitions(client):
@@ -891,6 +1214,56 @@ def test_viewer_cannot_create_or_update_models(client):
         },
     )
     assert created.status_code == 403
+
+
+def test_model_discovery_and_health_status(client):
+    owner_headers = auth_headers(role="owner", tenant_id="tenant-a")
+
+    created = client.post(
+        "/api/v1/models",
+        headers=owner_headers,
+        json={
+            "name": "catalog-model",
+            "provider": "openai-compatible",
+            "model_identifier": "model-a",
+            "capabilities": ["chat"],
+            "status": "ENABLED",
+        },
+    )
+    assert created.status_code == 201
+    model_id = created.json()["id"]
+
+    provider = OpenAICompatibleProvider(
+        Settings(
+            ai_base_url="https://provider.test/v1",
+            ai_api_key=Settings(ai_api_key="test-secret").ai_api_key,
+        ),
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json={"data": [{"id": "model-a"}, {"id": "model-b"}]},
+            )
+            if str(request.url).endswith("/models")
+            else httpx.Response(404)
+        ),
+    )
+    app.dependency_overrides[get_inference_provider] = lambda: provider
+
+    discovered = client.get(
+        "/api/v1/models/catalog/discover",
+        headers=owner_headers,
+    )
+    assert discovered.status_code == 200
+    assert discovered.json()["model_identifiers"] == ["model-a", "model-b"]
+
+    healthy = client.post(
+        f"/api/v1/models/{model_id}/health",
+        headers=owner_headers,
+    )
+    assert healthy.status_code == 200
+    assert healthy.json()["health_status"] == "HEALTHY"
+    assert healthy.json()["last_health_check_at"] is not None
+    assert healthy.json()["health_error"] is None
 
 
 def test_ai_inference_uses_registered_model_and_audits_without_prompt(client):

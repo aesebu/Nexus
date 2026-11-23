@@ -292,18 +292,19 @@ Security and governance system.
 
 | Core Module | Implemented in MVP | Outstanding |
 |---|---|---|
-| CORE-01: Control Engine | Command lifecycle, system registry, task lifecycle, event journal, tenant configuration store | Background task workers, event broker/dispatch, runtime health monitoring, live configuration application |
+| CORE-01: Control Engine | Command lifecycle, system registry, manual task lifecycle, durable AI inference worker queue, event journal, tenant configuration store | Additional task handlers, event broker/dispatch, runtime health monitoring, live configuration application |
 | CORE-02: AI Engine | OpenAI-compatible inference and NEXUS assistant chat with a fixed identity prompt and request-scoped messages | Persistent context, structured output, tool calling, response evaluation |
 | CORE-03: Model Intelligence | Tenant-scoped model registry and deterministic capability routing | Model discovery, evaluation, monitoring, additional provider adapters |
-| CORE-09: Security & Governance | Tenant RBAC, fail-closed command policies, payload-key approval rules, approval separation, audit, emergency stop, encrypted tenant secret store | Risk scoring, policy versioning, key rotation, external KMS |
+| CORE-09: Security & Governance | Tenant RBAC, fail-closed command policies, immutable policy version history, payload-key approval rules, approval separation, audit, emergency stop, encrypted tenant secret store | Risk scoring, key rotation, external KMS |
 
 Registry status is administrative metadata and does not prove runtime health.
-The task API records lifecycle state but does not run tasks; the event journal
-stores and filters events but does not dispatch them. Tenant configuration is
-stored for management only and is not a secret store or a live runtime
-configuration source. Secret values are encrypted with an externally supplied
-application key and are not returned by the HTTP API; key rotation and external
-KMS integration remain outstanding.
+The task worker executes queued AI inference work with database-backed leases;
+manual tasks still use lifecycle endpoints. The event journal stores and
+filters events but does not dispatch them. Tenant configuration is stored for
+management only and is not a secret store or a live runtime configuration
+source. Secret values are encrypted with an externally supplied application
+key and are not returned by the HTTP API; key rotation and external KMS
+integration remain outstanding.
 
 ---
 
@@ -483,11 +484,11 @@ The system must provide:
 
 | Phase | Development | Deliverable | Status |
 |---|---|---|---|
-| 00 | Project Foundation | Project Specification | Draft |
-| 01 | Supreme Architecture | Architecture Specification | Draft |
-| 02 | Authority & Governance | Governance Engine | In progress |
+| 00 | Project Foundation | Project Specification | Complete (validated) |
+| 01 | Supreme Architecture | Architecture Specification | Complete (validated) |
+| 02 | Authority & Governance | Governance Engine | Complete (validated) |
 | 03 | Core Foundation | Central Control | Complete (MVP) |
-| 04 | AI Infrastructure | Model Intelligence | Partial |
+| 04 | AI Infrastructure | Model Intelligence | Complete (validated) |
 | 05 | AI Engine | Inference Engine | Partial |
 | 06 | Agent Intelligence | Agent Engine | Planned |
 | 07 | Memory & Knowledge | Knowledge Platform | Planned |

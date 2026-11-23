@@ -20,11 +20,13 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.models import (
     AIModel,
+    AIModelHealthStatus,
     AIModelStatus,
     AuditEvent,
     Command,
     CommandPolicy,
     CommandPolicyPayloadRule,
+    CommandPolicyVersion,
     CommandStatus,
     TenantConfiguration,
     ControlEvent,
@@ -33,10 +35,14 @@ from app.models import (
     RegistryStatus,
     SystemRegistration,
     TaskStatus,
+    TaskWorkItem,
     TenantSecret,
+    WorkItemStatus,
 )
 from app.schemas import (
     AIModelCreate,
+    AIModelDiscoveryResponse,
+    AIModelHealthResponse,
     AIModelResponse,
     AIModelUpdate,
     AuditResponse,
@@ -44,6 +50,7 @@ from app.schemas import (
     CommandPolicyCreate,
     CommandPolicyResponse,
     CommandPolicyUpdate,
+    CommandPolicyVersionResponse,
     CommandResponse,
     ConfigurationResponse,
     ConfigurationUpsert,
@@ -100,7 +107,11 @@ def audit(
 
 
 def emergency_stop(db: Session, tenant_id: str) -> EmergencyStop:
-    stop = db.scalar(select(EmergencyStop).where(EmergencyStop.tenant_id == tenant_id))
+    stop = db.scalar(
+        select(EmergencyStop)
+        .where(EmergencyStop.tenant_id == tenant_id)
+        .with_for_update()
+    )
     if stop is None:
         stop = EmergencyStop(tenant_id=tenant_id, active=False)
         db.add(stop)
@@ -119,9 +130,56 @@ def _command_policy_response(
             .order_by(CommandPolicyPayloadRule.payload_key.asc())
         )
     )
-    return CommandPolicyResponse.model_validate(policy).model_copy(
-        update={"approval_payload_keys": payload_keys}
+    latest_version = db.scalar(
+        select(CommandPolicyVersion)
+        .where(CommandPolicyVersion.policy_id == policy.id)
+        .order_by(CommandPolicyVersion.version.desc())
+        .limit(1)
     )
+    return CommandPolicyResponse.model_validate(policy).model_copy(
+        update={
+            "approval_payload_keys": payload_keys,
+            "version": latest_version.version if latest_version is not None else 1,
+        }
+    )
+
+
+def _policy_snapshot(policy: CommandPolicy, payload_keys: list[str]) -> dict[str, Any]:
+    return {
+        "command_type": policy.command_type,
+        "require_approval": policy.require_approval,
+        "require_different_approver": policy.require_different_approver,
+        "enabled": policy.enabled,
+        "description": policy.description,
+        "approval_payload_keys": sorted(payload_keys),
+    }
+
+
+def _latest_policy_version(db: Session, policy_id: str) -> CommandPolicyVersion | None:
+    return db.scalar(
+        select(CommandPolicyVersion)
+        .where(CommandPolicyVersion.policy_id == policy_id)
+        .order_by(CommandPolicyVersion.version.desc())
+        .limit(1)
+    )
+
+
+def _store_policy_version(
+    db: Session,
+    *,
+    policy: CommandPolicy,
+    snapshot: dict[str, Any],
+    changed_by: str,
+    version: int,
+) -> CommandPolicyVersion:
+    policy_version = CommandPolicyVersion(
+        policy_id=policy.id,
+        version=version,
+        snapshot=snapshot,
+        changed_by=changed_by,
+    )
+    db.add(policy_version)
+    return policy_version
 
 
 def _payload_has_path(payload: dict[str, Any], path: str) -> bool:
@@ -169,6 +227,14 @@ def create_command_policy(
             CommandPolicyPayloadRule(policy_id=policy.id, payload_key=payload_key)
             for payload_key in request.approval_payload_keys
         )
+        snapshot = _policy_snapshot(policy, request.approval_payload_keys)
+        _store_policy_version(
+            db,
+            policy=policy,
+            snapshot=snapshot,
+            changed_by=actor,
+            version=1,
+        )
         audit(
             db,
             tenant_id=tenant_id,
@@ -183,6 +249,7 @@ def create_command_policy(
                 "require_different_approver": policy.require_different_approver,
                 "enabled": policy.enabled,
                 "approval_payload_keys": request.approval_payload_keys,
+                "version": 1,
             },
         )
         db.commit()
@@ -212,6 +279,62 @@ def list_command_policies(
     return [_command_policy_response(db, policy) for policy in policies]
 
 
+@router.get(
+    "/policies/commands/{policy_id}/versions",
+    response_model=list[CommandPolicyVersionResponse],
+)
+def list_command_policy_versions(
+    policy_id: str,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.policy.read")),
+) -> list[CommandPolicyVersionResponse]:
+    _actor, tenant_id = identity
+    policy = db.scalar(
+        select(CommandPolicy).where(
+            CommandPolicy.id == policy_id,
+            CommandPolicy.tenant_id == tenant_id,
+        )
+    )
+    if policy is None:
+        raise HTTPException(status_code=404, detail="Command policy not found")
+
+    versions = list(
+        db.scalars(
+            select(CommandPolicyVersion)
+            .where(CommandPolicyVersion.policy_id == policy.id)
+            .order_by(CommandPolicyVersion.version.asc())
+        )
+    )
+    if versions:
+        return [
+            CommandPolicyVersionResponse(
+                policy_id=version.policy_id,
+                version=version.version,
+                snapshot=version.snapshot,
+                changed_by=version.changed_by,
+                created_at=version.created_at,
+            )
+            for version in versions
+        ]
+
+    payload_keys = list(
+        db.scalars(
+            select(CommandPolicyPayloadRule.payload_key)
+            .where(CommandPolicyPayloadRule.policy_id == policy.id)
+            .order_by(CommandPolicyPayloadRule.payload_key.asc())
+        )
+    )
+    return [
+        CommandPolicyVersionResponse(
+            policy_id=policy.id,
+            version=1,
+            snapshot=_policy_snapshot(policy, payload_keys),
+            changed_by=policy.created_by,
+            created_at=policy.created_at,
+        )
+    ]
+
+
 @router.patch(
     "/policies/commands/{policy_id}",
     response_model=CommandPolicyResponse,
@@ -227,16 +350,38 @@ def update_command_policy(
         select(CommandPolicy).where(
             CommandPolicy.id == policy_id,
             CommandPolicy.tenant_id == tenant_id,
-        )
+        ).with_for_update()
     )
     if policy is None:
         raise HTTPException(status_code=404, detail="Command policy not found")
 
     updates = request.model_dump(exclude_unset=True)
     payload_keys = updates.pop("approval_payload_keys", None)
+    current_payload_keys = list(
+        db.scalars(
+            select(CommandPolicyPayloadRule.payload_key)
+            .where(CommandPolicyPayloadRule.policy_id == policy.id)
+            .order_by(CommandPolicyPayloadRule.payload_key.asc())
+        )
+    )
+    previous_snapshot = _policy_snapshot(policy, current_payload_keys)
+    latest_version = _latest_policy_version(db, policy.id)
+    current_version = latest_version.version if latest_version is not None else 1
+    if latest_version is None:
+        _store_policy_version(
+            db,
+            policy=policy,
+            snapshot=previous_snapshot,
+            changed_by=policy.created_by,
+            version=1,
+        )
+
     for field, value in updates.items():
         setattr(policy, field, value)
 
+    updated_payload_keys = (
+        payload_keys if payload_keys is not None else current_payload_keys
+    )
     if payload_keys is not None:
         db.execute(
             delete(CommandPolicyPayloadRule).where(
@@ -246,6 +391,17 @@ def update_command_policy(
         db.add_all(
             CommandPolicyPayloadRule(policy_id=policy.id, payload_key=payload_key)
             for payload_key in payload_keys
+        )
+
+    updated_snapshot = _policy_snapshot(policy, updated_payload_keys)
+    if updated_snapshot != previous_snapshot:
+        current_version += 1
+        _store_policy_version(
+            db,
+            policy=policy,
+            snapshot=updated_snapshot,
+            changed_by=actor,
+            version=current_version,
         )
 
     audit(
@@ -259,10 +415,18 @@ def update_command_policy(
         detail={
             "fields": sorted(
                 [*updates, *(["approval_payload_keys"] if payload_keys is not None else [])]
-            )
+            ),
+            "version": current_version,
         },
     )
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Command policy changed concurrently; retry the request",
+        ) from exc
     db.refresh(policy)
     return _command_policy_response(db, policy)
 
@@ -411,12 +575,19 @@ def control_task_for_tenant(
     return task
 
 
+def task_response(db: Session, task: ControlTask) -> TaskResponse:
+    work_item = db.get(TaskWorkItem, task.id)
+    return TaskResponse.model_validate(task).model_copy(
+        update={"work_type": work_item.work_type if work_item is not None else None}
+    )
+
+
 @router.post("/tasks", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
 def create_task(
     request: TaskCreate,
     db: Session = Depends(get_db),
     identity=Depends(require_permission("nexus.task.manage")),
-) -> ControlTask:
+) -> TaskResponse:
     actor, tenant_id = identity
     if emergency_stop(db, tenant_id).active:
         raise HTTPException(status_code=409, detail="Emergency stop is active")
@@ -430,6 +601,18 @@ def create_task(
     )
     db.add(task)
     db.flush()
+    if request.work_type is not None:
+        if request.work_payload is None:
+            raise HTTPException(status_code=422, detail="work_payload is required")
+        db.add(
+            TaskWorkItem(
+                task_id=task.id,
+                tenant_id=tenant_id,
+                work_type=request.work_type,
+                payload=request.work_payload,
+                status=WorkItemStatus.PENDING,
+            )
+        )
     audit(
         db,
         tenant_id=tenant_id,
@@ -438,11 +621,14 @@ def create_task(
         resource_type="ControlTask",
         resource_id=task.id,
         outcome="SUCCESS",
-        detail={"status": task.status.value},
+        detail={
+            "status": task.status.value,
+            "work_type": request.work_type,
+        },
     )
     db.commit()
     db.refresh(task)
-    return task
+    return task_response(db, task)
 
 
 @router.get("/tasks", response_model=list[TaskResponse])
@@ -452,7 +638,7 @@ def list_tasks(
     task_status: TaskStatus | None = Query(default=None, alias="status"),
     limit: int = Query(default=100, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
-) -> list[ControlTask]:
+) -> list[TaskResponse]:
     _actor, tenant_id = identity
     statement = select(ControlTask).where(ControlTask.tenant_id == tenant_id)
     if task_status is not None:
@@ -460,7 +646,7 @@ def list_tasks(
     statement = (
         statement.order_by(ControlTask.created_at.desc()).offset(offset).limit(limit)
     )
-    return list(db.scalars(statement))
+    return [task_response(db, task) for task in db.scalars(statement)]
 
 
 @router.get("/tasks/{task_id}", response_model=TaskResponse)
@@ -468,9 +654,10 @@ def get_task(
     task_id: str,
     db: Session = Depends(get_db),
     identity=Depends(require_permission("nexus.task.read")),
-) -> ControlTask:
+) -> TaskResponse:
     _actor, tenant_id = identity
-    return control_task_for_tenant(db, task_id=task_id, tenant_id=tenant_id)
+    task = control_task_for_tenant(db, task_id=task_id, tenant_id=tenant_id)
+    return task_response(db, task)
 
 
 @router.post("/tasks/{task_id}/start", response_model=TaskResponse)
@@ -478,9 +665,20 @@ def start_task(
     task_id: str,
     db: Session = Depends(get_db),
     identity=Depends(require_permission("nexus.task.manage")),
-) -> ControlTask:
+) -> TaskResponse:
     actor, tenant_id = identity
-    task = control_task_for_tenant(db, task_id=task_id, tenant_id=tenant_id)
+    task = db.scalar(
+        select(ControlTask)
+        .where(ControlTask.id == task_id, ControlTask.tenant_id == tenant_id)
+        .with_for_update()
+    )
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if db.get(TaskWorkItem, task.id) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Worker-managed tasks can only be started by the background worker",
+        )
     if task.status != TaskStatus.PENDING:
         raise HTTPException(
             status_code=409,
@@ -503,7 +701,7 @@ def start_task(
     )
     db.commit()
     db.refresh(task)
-    return task
+    return task_response(db, task)
 
 
 @router.post("/tasks/{task_id}/complete", response_model=TaskResponse)
@@ -512,9 +710,20 @@ def complete_task(
     request: TaskComplete,
     db: Session = Depends(get_db),
     identity=Depends(require_permission("nexus.task.manage")),
-) -> ControlTask:
+) -> TaskResponse:
     actor, tenant_id = identity
-    task = control_task_for_tenant(db, task_id=task_id, tenant_id=tenant_id)
+    task = db.scalar(
+        select(ControlTask)
+        .where(ControlTask.id == task_id, ControlTask.tenant_id == tenant_id)
+        .with_for_update()
+    )
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if db.get(TaskWorkItem, task.id) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Worker-managed tasks are completed by the background worker",
+        )
     if task.status != TaskStatus.IN_PROGRESS:
         raise HTTPException(
             status_code=409,
@@ -536,7 +745,7 @@ def complete_task(
     )
     db.commit()
     db.refresh(task)
-    return task
+    return task_response(db, task)
 
 
 @router.post("/tasks/{task_id}/fail", response_model=TaskResponse)
@@ -545,9 +754,20 @@ def fail_task(
     request: TaskFail,
     db: Session = Depends(get_db),
     identity=Depends(require_permission("nexus.task.manage")),
-) -> ControlTask:
+) -> TaskResponse:
     actor, tenant_id = identity
-    task = control_task_for_tenant(db, task_id=task_id, tenant_id=tenant_id)
+    task = db.scalar(
+        select(ControlTask)
+        .where(ControlTask.id == task_id, ControlTask.tenant_id == tenant_id)
+        .with_for_update()
+    )
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if db.get(TaskWorkItem, task.id) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Worker-managed tasks are failed by the background worker",
+        )
     if task.status != TaskStatus.IN_PROGRESS:
         raise HTTPException(
             status_code=409,
@@ -569,7 +789,7 @@ def fail_task(
     )
     db.commit()
     db.refresh(task)
-    return task
+    return task_response(db, task)
 
 
 @router.post("/tasks/{task_id}/cancel", response_model=TaskResponse)
@@ -577,9 +797,34 @@ def cancel_task(
     task_id: str,
     db: Session = Depends(get_db),
     identity=Depends(require_permission("nexus.task.manage")),
-) -> ControlTask:
+) -> TaskResponse:
     actor, tenant_id = identity
-    task = control_task_for_tenant(db, task_id=task_id, tenant_id=tenant_id)
+    existing_task = db.scalar(
+        select(ControlTask)
+        .where(
+            ControlTask.id == task_id,
+            ControlTask.tenant_id == tenant_id,
+        )
+    )
+    if existing_task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    work_item = db.scalar(
+        select(TaskWorkItem)
+        .where(TaskWorkItem.task_id == existing_task.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    task = db.scalar(
+        select(ControlTask)
+        .where(
+            ControlTask.id == task_id,
+            ControlTask.tenant_id == tenant_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
     if task.status not in {TaskStatus.PENDING, TaskStatus.IN_PROGRESS}:
         raise HTTPException(
             status_code=409,
@@ -588,6 +833,10 @@ def cancel_task(
 
     task.status = TaskStatus.CANCELLED
     task.finished_at = utcnow()
+    if work_item is not None:
+        work_item.status = WorkItemStatus.CANCELLED
+        work_item.claimed_by = None
+        work_item.lease_expires_at = None
     audit(
         db,
         tenant_id=tenant_id,
@@ -600,7 +849,7 @@ def cancel_task(
     )
     db.commit()
     db.refresh(task)
-    return task
+    return task_response(db, task)
 
 
 @router.post("/events", response_model=EventResponse, status_code=status.HTTP_201_CREATED)
@@ -906,16 +1155,23 @@ def create_command(
         )
     )
     approval_payload_rule_matched = False
+    policy_snapshot = None
+    policy_version = None
     if policy is not None:
-        approval_payload_keys = db.scalars(
-            select(CommandPolicyPayloadRule.payload_key).where(
-                CommandPolicyPayloadRule.policy_id == policy.id
+        approval_payload_keys = list(
+            db.scalars(
+                select(CommandPolicyPayloadRule.payload_key).where(
+                    CommandPolicyPayloadRule.policy_id == policy.id
+                )
             )
         )
         approval_payload_rule_matched = any(
             _payload_has_path(request.payload, payload_key)
             for payload_key in approval_payload_keys
         )
+        latest_version = _latest_policy_version(db, policy.id)
+        policy_version = latest_version.version if latest_version is not None else 1
+        policy_snapshot = _policy_snapshot(policy, approval_payload_keys)
     require_approval = (
         request.require_approval
         or policy is None
@@ -951,6 +1207,8 @@ def create_command(
             "require_approval": require_approval,
             "require_different_approver": require_different_approver,
             "policy_id": policy.id if policy is not None else None,
+            "policy_version": policy_version,
+            "policy_snapshot": policy_snapshot,
             "approval_payload_rule_matched": approval_payload_rule_matched,
         },
     )
@@ -1002,7 +1260,9 @@ def approve_command(
         raise HTTPException(status_code=409, detail="Emergency stop is active")
 
     command = db.scalar(
-        select(Command).where(Command.id == command_id, Command.tenant_id == tenant_id)
+        select(Command)
+        .where(Command.id == command_id, Command.tenant_id == tenant_id)
+        .with_for_update()
     )
     if command is None:
         raise HTTPException(status_code=404, detail="Command not found")
@@ -1068,7 +1328,9 @@ def execute_command(
         raise HTTPException(status_code=409, detail="Emergency stop is active")
 
     command = db.scalar(
-        select(Command).where(Command.id == command_id, Command.tenant_id == tenant_id)
+        select(Command)
+        .where(Command.id == command_id, Command.tenant_id == tenant_id)
+        .with_for_update()
     )
     if command is None:
         raise HTTPException(status_code=404, detail="Command not found")
@@ -1334,6 +1596,113 @@ def route_model(
 
 def get_inference_provider() -> InferenceProvider:
     return OpenAICompatibleProvider(settings)
+
+
+@router.get(
+    "/models/catalog/discover",
+    response_model=AIModelDiscoveryResponse,
+)
+def discover_models(
+    provider_name: str = Query(default="openai-compatible", min_length=1, max_length=128),
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.model.route")),
+    provider: InferenceProvider = Depends(get_inference_provider),
+) -> AIModelDiscoveryResponse:
+    actor, tenant_id = identity
+    if provider_name != provider.provider_name:
+        raise HTTPException(
+            status_code=501,
+            detail=f"Provider {provider_name} is not supported for discovery",
+        )
+    try:
+        identifiers = provider.discover_models()
+    except ProviderNotConfiguredError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ProviderTimeoutError as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    except (ProviderRequestError, ProviderResponseError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    audit(
+        db,
+        tenant_id=tenant_id,
+        actor=actor,
+        action="MODEL_DISCOVERY_COMPLETED",
+        resource_type="AIModel",
+        resource_id=None,
+        outcome="SUCCESS",
+        detail={
+            "provider": provider_name,
+            "model_count": len(identifiers),
+        },
+    )
+    db.commit()
+    return AIModelDiscoveryResponse(
+        provider=provider_name,
+        model_identifiers=identifiers,
+    )
+
+
+@router.post(
+    "/models/{model_id}/health",
+    response_model=AIModelHealthResponse,
+)
+def check_model_health(
+    model_id: str,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.model.update")),
+    provider: InferenceProvider = Depends(get_inference_provider),
+) -> AIModelHealthResponse:
+    actor, tenant_id = identity
+    model = db.scalar(
+        select(AIModel)
+        .where(AIModel.id == model_id, AIModel.tenant_id == tenant_id)
+        .with_for_update()
+    )
+    if model is None:
+        raise HTTPException(status_code=404, detail="Model not found")
+    if model.provider != provider.provider_name:
+        raise HTTPException(
+            status_code=501,
+            detail=f"Provider {model.provider} is not supported for health checks",
+        )
+
+    checked_at = utcnow()
+    try:
+        identifiers = provider.discover_models()
+        if model.model_identifier in identifiers:
+            model.health_status = AIModelHealthStatus.HEALTHY
+            model.health_error = None
+            outcome = "SUCCESS"
+            action = "MODEL_HEALTH_CHECK_COMPLETED"
+        else:
+            model.health_status = AIModelHealthStatus.UNHEALTHY
+            model.health_error = "Model identifier is not present in the provider catalog"
+            outcome = "FAILED"
+            action = "MODEL_HEALTH_CHECK_COMPLETED"
+    except (ProviderNotConfiguredError, ProviderTimeoutError, ProviderRequestError, ProviderResponseError) as exc:
+        model.health_status = AIModelHealthStatus.UNHEALTHY
+        model.health_error = str(exc)[:2000]
+        outcome = "FAILED"
+        action = "MODEL_HEALTH_CHECK_COMPLETED"
+
+    model.last_health_check_at = checked_at
+    audit(
+        db,
+        tenant_id=tenant_id,
+        actor=actor,
+        action=action,
+        resource_type="AIModel",
+        resource_id=model.id,
+        outcome=outcome,
+        detail={
+            "health_status": model.health_status.value,
+            "provider": model.provider,
+        },
+    )
+    db.commit()
+    db.refresh(model)
+    return model
 
 
 def _run_inference(

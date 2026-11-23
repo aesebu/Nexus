@@ -73,7 +73,21 @@ def require_permission(permission: str):
 
         token = authorization.removeprefix("Bearer ").strip()
         try:
-            claims = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+            if settings.environment == "production":
+                claims = jwt.decode(
+                    token,
+                    settings.jwt_secret,
+                    algorithms=[settings.jwt_algorithm],
+                    issuer=settings.jwt_issuer,
+                    audience=settings.jwt_audience,
+                    options={"require": ["exp", "iss", "aud"]},
+                )
+            else:
+                claims = jwt.decode(
+                    token,
+                    settings.jwt_secret,
+                    algorithms=[settings.jwt_algorithm],
+                )
         except JWTError as exc:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token") from exc
 

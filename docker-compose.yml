@@ -3,9 +3,38 @@ services:
     build: .
     ports:
       - "8000:8000"
+    command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
     environment:
-      NEXUS_DATABASE_URL: postgresql://nexus:nexus@postgres:5432/nexus
-      NEXUS_JWT_SECRET: ${NEXUS_JWT_SECRET:-change-this-in-production}
+      NEXUS_ENVIRONMENT: production
+      NEXUS_DATABASE_URL: postgresql://nexus:${POSTGRES_PASSWORD}@postgres:5432/nexus
+      NEXUS_JWT_SECRET: ${NEXUS_JWT_SECRET:?Set NEXUS_JWT_SECRET}
+      NEXUS_JWT_ISSUER: ${NEXUS_JWT_ISSUER:-nexus}
+      NEXUS_JWT_AUDIENCE: ${NEXUS_JWT_AUDIENCE:-nexus-api}
+      NEXUS_SECRET_ENCRYPTION_KEY: ${NEXUS_SECRET_ENCRYPTION_KEY:?Set NEXUS_SECRET_ENCRYPTION_KEY}
+      NEXUS_AI_BASE_URL: ${NEXUS_AI_BASE_URL:-https://api.openai.com/v1}
+      NEXUS_AI_API_KEY: ${NEXUS_AI_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready', timeout=5)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  worker:
+    build: .
+    command: ["sh", "-c", "alembic upgrade head && python -m app.worker"]
+    restart: unless-stopped
+    environment:
+      NEXUS_ENVIRONMENT: production
+      NEXUS_DATABASE_URL: postgresql://nexus:${POSTGRES_PASSWORD}@postgres:5432/nexus
+      NEXUS_JWT_SECRET: ${NEXUS_JWT_SECRET:?Set NEXUS_JWT_SECRET}
+      NEXUS_JWT_ISSUER: ${NEXUS_JWT_ISSUER:-nexus}
+      NEXUS_JWT_AUDIENCE: ${NEXUS_JWT_AUDIENCE:-nexus-api}
+      NEXUS_SECRET_ENCRYPTION_KEY: ${NEXUS_SECRET_ENCRYPTION_KEY:?Set NEXUS_SECRET_ENCRYPTION_KEY}
+      NEXUS_AI_BASE_URL: ${NEXUS_AI_BASE_URL:-https://api.openai.com/v1}
+      NEXUS_AI_API_KEY: ${NEXUS_AI_API_KEY:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -15,7 +44,7 @@ services:
     environment:
       POSTGRES_DB: nexus
       POSTGRES_USER: nexus
-      POSTGRES_PASSWORD: nexus
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
     volumes:
       - nexus-postgres:/var/lib/postgresql/data
     healthcheck:

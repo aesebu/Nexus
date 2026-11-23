@@ -8,11 +8,18 @@ from pydantic import (
     ConfigDict,
     Field,
     SecretStr,
+    ValidationError,
     field_validator,
     model_validator,
 )
 
-from app.models import AIModelStatus, CommandStatus, RegistryStatus, TaskStatus
+from app.models import (
+    AIModelHealthStatus,
+    AIModelStatus,
+    CommandStatus,
+    RegistryStatus,
+    TaskStatus,
+)
 
 
 class CommandCreate(BaseModel):
@@ -99,6 +106,7 @@ class CommandPolicyResponse(BaseModel):
     id: str
     tenant_id: str
     command_type: str
+    version: int = 1
     require_approval: bool
     require_different_approver: bool
     enabled: bool
@@ -107,6 +115,14 @@ class CommandPolicyResponse(BaseModel):
     created_by: str
     created_at: datetime
     updated_at: datetime
+
+
+class CommandPolicyVersionResponse(BaseModel):
+    policy_id: str
+    version: int
+    snapshot: dict[str, Any]
+    changed_by: str
+    created_at: datetime
 
 
 class SystemRegistrationCreate(BaseModel):
@@ -148,11 +164,6 @@ class SystemRegistrationResponse(BaseModel):
     updated_at: datetime
 
 
-class TaskCreate(BaseModel):
-    title: str = Field(min_length=1, max_length=200)
-    description: str | None = Field(default=None, max_length=10_000)
-
-
 class TaskComplete(BaseModel):
     result: str | None = Field(default=None, max_length=10_000)
 
@@ -169,6 +180,7 @@ class TaskResponse(BaseModel):
     title: str
     description: str | None
     status: TaskStatus
+    work_type: str | None = None
     created_by: str
     created_at: datetime
     updated_at: datetime
@@ -176,6 +188,39 @@ class TaskResponse(BaseModel):
     finished_at: datetime | None
     result: str | None
     failure_reason: str | None
+
+
+class TaskCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=10_000)
+    work_type: Literal["ai.inference"] | None = None
+    work_payload: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def validate_work_payload(self) -> "TaskCreate":
+        if self.work_type is None:
+            if self.work_payload is not None:
+                raise ValueError("work_payload requires a supported work_type")
+            return self
+        if self.work_payload is None:
+            raise ValueError("work_payload is required for ai.inference tasks")
+
+        try:
+            request = InferenceRequest.model_validate(self.work_payload)
+            self.work_payload = request.model_dump(mode="json")
+            serialized = json.dumps(
+                self.work_payload,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        except ValidationError as exc:
+            raise ValueError("work_payload is not a valid inference request") from exc
+        except (TypeError, ValueError) as exc:
+            raise ValueError("work_payload must contain JSON-compatible data") from exc
+        if len(serialized.encode("utf-8")) > 64 * 1024:
+            raise ValueError("work_payload must not exceed 64 KiB")
+        return self
 
 
 class EventCreate(BaseModel):
@@ -331,8 +376,28 @@ class AIModelResponse(BaseModel):
     capabilities: list[str]
     status: AIModelStatus
     priority: int
+    health_status: AIModelHealthStatus
+    last_health_check_at: datetime | None
+    health_error: str | None
     created_at: datetime
     updated_at: datetime
+
+
+class AIModelDiscoveryResponse(BaseModel):
+    provider: str
+    model_identifiers: list[str]
+
+
+class AIModelHealthResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    name: str
+    provider: str
+    model_identifier: str
+    health_status: AIModelHealthStatus
+    last_health_check_at: datetime | None
+    health_error: str | None
 
 
 class ModelRouteRequest(BaseModel):

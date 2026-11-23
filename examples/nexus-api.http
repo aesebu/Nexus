@@ -60,3 +60,21 @@ Content-Type: application/json
   "temperature": 0.2,
   "max_tokens": 256
 }
+
+### Queue an AI inference task for the background worker
+POST {{baseUrl}}/api/v1/tasks
+Authorization: Bearer {{token}}
+X-Tenant-ID: {{tenantId}}
+Content-Type: application/json
+
+{
+  "title": "Summarize a request",
+  "work_type": "ai.inference",
+  "work_payload": {
+    "messages": [
+      {"role": "user", "content": "Summarize the NEXUS MVP in one sentence."}
+    ],
+    "temperature": 0.2,
+    "max_tokens": 128
+  }
+}

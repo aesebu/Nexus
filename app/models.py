@@ -31,6 +31,12 @@ class AIModelStatus(str, enum.Enum):
     DEPRECATED = "DEPRECATED"
 
 
+class AIModelHealthStatus(str, enum.Enum):
+    UNKNOWN = "UNKNOWN"
+    HEALTHY = "HEALTHY"
+    UNHEALTHY = "UNHEALTHY"
+
+
 class RegistryStatus(str, enum.Enum):
     REGISTERED = "REGISTERED"
     ENABLED = "ENABLED"
@@ -40,6 +46,14 @@ class RegistryStatus(str, enum.Enum):
 class TaskStatus(str, enum.Enum):
     PENDING = "PENDING"
     IN_PROGRESS = "IN_PROGRESS"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class WorkItemStatus(str, enum.Enum):
+    PENDING = "PENDING"
+    CLAIMED = "CLAIMED"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
@@ -98,6 +112,22 @@ class CommandPolicyPayloadRule(Base):
     payload_key: Mapped[str] = mapped_column(String(128))
 
 
+class CommandPolicyVersion(Base):
+    __tablename__ = "command_policy_versions"
+    __table_args__ = (
+        UniqueConstraint("policy_id", "version", name="uq_command_policy_version"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    policy_id: Mapped[str] = mapped_column(
+        ForeignKey("command_policies.id", ondelete="CASCADE"), index=True
+    )
+    version: Mapped[int] = mapped_column()
+    snapshot: Mapped[dict] = mapped_column(JSON)
+    changed_by: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class SystemRegistration(Base):
     __tablename__ = "system_registry"
     __table_args__ = (
@@ -140,6 +170,29 @@ class ControlTask(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     result: Mapped[str | None] = mapped_column(Text, nullable=True)
     failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class TaskWorkItem(Base):
+    __tablename__ = "task_work_items"
+
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("control_tasks.id", ondelete="CASCADE"), primary_key=True
+    )
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    work_type: Mapped[str] = mapped_column(String(64))
+    payload: Mapped[dict] = mapped_column(JSON)
+    status: Mapped[WorkItemStatus] = mapped_column(
+        Enum(WorkItemStatus), default=WorkItemStatus.PENDING, index=True
+    )
+    attempts: Mapped[int] = mapped_column(default=0)
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+    claimed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class ControlEvent(Base):
@@ -228,6 +281,15 @@ class AIModel(Base):
         Enum(AIModelStatus), default=AIModelStatus.ENABLED, index=True
     )
     priority: Mapped[int] = mapped_column(default=0)
+    health_status: Mapped[AIModelHealthStatus] = mapped_column(
+        Enum(AIModelHealthStatus),
+        default=AIModelHealthStatus.UNKNOWN,
+        index=True,
+    )
+    last_health_check_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    health_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow

@@ -50,6 +50,8 @@ class InferenceProvider(Protocol):
         max_tokens: int,
     ) -> InferenceResult: ...
 
+    def discover_models(self) -> list[str]: ...
+
 
 class OpenAICompatibleProvider:
     provider_name = "openai-compatible"
@@ -130,3 +132,46 @@ class OpenAICompatibleProvider:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
         )
+
+    def discover_models(self) -> list[str]:
+        if self._settings.ai_api_key is None:
+            raise ProviderNotConfiguredError("AI provider API key is not configured")
+
+        try:
+            with httpx.Client(
+                timeout=30.0,
+                transport=self._transport,
+            ) as client:
+                response = client.get(
+                    f"{self._settings.ai_base_url.rstrip('/')}/models",
+                    headers={
+                        "Authorization": (
+                            f"Bearer {self._settings.ai_api_key.get_secret_value()}"
+                        ),
+                        "Content-Type": "application/json",
+                    },
+                )
+                response.raise_for_status()
+        except httpx.TimeoutException as exc:
+            raise ProviderTimeoutError("AI provider request timed out") from exc
+        except httpx.HTTPStatusError as exc:
+            raise ProviderRequestError(
+                f"AI provider returned HTTP {exc.response.status_code}"
+            ) from exc
+        except httpx.RequestError as exc:
+            raise ProviderRequestError("AI provider request failed") from exc
+
+        try:
+            body = response.json()
+            data = body["data"]
+            if not isinstance(data, list):
+                raise TypeError("model data is not a list")
+            identifiers = []
+            for item in data:
+                identifier = item["id"]
+                if not isinstance(identifier, str) or not identifier:
+                    raise TypeError("model identifier is invalid")
+                identifiers.append(identifier)
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            raise ProviderResponseError("AI provider returned an invalid model catalog") from exc
+        return sorted(set(identifiers))

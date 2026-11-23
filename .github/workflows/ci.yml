@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -e ".[test]"
+      - name: Run Python compilation
+        run: python -m compileall -q app tests
+      - name: Run tests
+        run: pytest -q
+      - name: Verify migrations on SQLite
+        env:
+          NEXUS_DATABASE_URL: sqlite:////tmp/nexus-ci.db
+        run: |
+          rm -f /tmp/nexus-ci.db
+          alembic upgrade head
+          alembic downgrade base

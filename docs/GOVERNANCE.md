@@ -1,9 +1,11 @@
-# Governance MVP
+# Governance Engine - Phase 02 MVP
 
 The current governance slice provides tenant-scoped command policies,
 approval enforcement, separation of duties, audit evidence, and encrypted
-tenant secret storage. It implements part of roadmap Phase 02; risk scoring
-and policy versioning are not implemented yet.
+tenant secret storage. Policy changes create immutable, numbered snapshots,
+and command creation audit events record the exact policy version and snapshot
+used for the decision. It completes the Phase 02 Authority and Governance MVP;
+risk scoring and external identity/KMS integration remain outside this phase.
 
 ## Command policies
 
@@ -31,6 +33,15 @@ Use `GET /api/v1/policies/commands` to list policies and
 disable a policy. Policies may also set `approval_payload_keys` to dotted paths
 in the command's JSON object payload.
 
+Policy responses include a monotonically increasing `version`, starting at 1.
+An effective configuration change creates a new immutable version; repeating
+an update with the same effective configuration does not. Retrieve the
+tenant-scoped history with
+`GET /api/v1/policies/commands/{policy_id}/versions`. Each record includes the
+configuration snapshot, authenticated actor, and timestamp. Existing policies
+created before version history was added are exposed as version 1 and gain a
+persisted baseline when first updated.
+
 ## Payload-triggered approvals
 
 If any configured `approval_payload_keys` path exists in a command payload,
@@ -52,7 +63,9 @@ These explicit rules are not a general risk score or classifier.
 - Disabling a policy returns the command type to the fail-closed default.
 - By default, the command creator cannot approve their own command. The
   creation audit event stores the policy decision so later policy changes do
-  not change the approval rule for an existing command.
+  not change the approval rule for an existing command. When a policy is used,
+  this event also records its version and full non-secret configuration
+  snapshot.
 - Rejected self-approval attempts are audited; command payloads are not added
   to governance audit details.
 
@@ -79,15 +92,15 @@ that needs a value must use the tenant-scoped `resolve_secret` helper.
 
 The store uses application-level Fernet encryption for database values. The
 active key is not versioned: changing or losing it makes existing secrets
-unreadable. Key rotation, external KMS integration, and database migrations
-remain future work. Deploy the API behind TLS and do not treat this MVP as a
-production-grade secrets platform.
+unreadable. Key rotation and external KMS integration remain future work.
+Deploy the API behind TLS and do not treat this MVP as a production-grade
+secrets platform.
 
 ## Scope and next work
 
 This MVP selects policy by exact command type and can require approval when
 explicitly configured payload keys are present. It does not evaluate payload
-values, autonomy levels, resource limits, or risk scores. Risk scoring, policy
-versioning, key rotation, external KMS integration, and migrations are
+values, autonomy levels, resource limits, or risk scores. Risk scoring, secret
+key rotation, external KMS integration, and production database migrations are
 outstanding roadmap work. Do not treat this policy slice as a complete
 production governance system.

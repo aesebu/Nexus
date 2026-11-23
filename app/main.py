@@ -2,15 +2,18 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from sqlalchemy import text
 
 from app.core.database import Base, engine
+from app.core.config import settings
 from app import models  # noqa: F401
 from app.api.routes import router
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    Base.metadata.create_all(bind=engine)
+    if settings.environment != "production":
+        Base.metadata.create_all(bind=engine)
     yield
 
 
@@ -28,6 +31,24 @@ app.include_router(router, prefix="/api/v1")
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "healthy"}
+
+
+@app.get("/health/live")
+def liveness() -> dict[str, str]:
+    return {"status": "alive"}
+
+
+@app.get("/health/ready")
+def readiness() -> dict[str, str]:
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+    except Exception as exc:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "not_ready", "detail": "database unavailable"},
+        )
+    return {"status": "ready"}
 
 
 @app.exception_handler(ValueError)

@@ -90,3 +90,45 @@ def test_provider_surfaces_upstream_errors_and_invalid_responses():
             temperature=0.4,
             max_tokens=50,
         )
+
+
+def test_openai_compatible_provider_discovers_model_catalog():
+    received = {}
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        received["url"] = str(request.url)
+        received["authorization"] = request.headers["Authorization"]
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"id": "model-b"},
+                    {"id": "model-a"},
+                    {"id": "model-b"},
+                ]
+            },
+        )
+
+    provider = OpenAICompatibleProvider(
+        Settings(
+            ai_base_url="https://provider.test/v1",
+            ai_api_key=SecretStr("test-secret"),
+        ),
+        transport=httpx.MockTransport(handle),
+    )
+
+    assert provider.discover_models() == ["model-a", "model-b"]
+    assert received["url"] == "https://provider.test/v1/models"
+    assert received["authorization"] == "Bearer test-secret"
+
+
+def test_provider_catalog_rejects_invalid_response():
+    provider = OpenAICompatibleProvider(
+        Settings(ai_api_key=SecretStr("test-secret")),
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={"data": "invalid"})
+        ),
+    )
+
+    with pytest.raises(ProviderResponseError, match="invalid model catalog"):
+        provider.discover_models()
