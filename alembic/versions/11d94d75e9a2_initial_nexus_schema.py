@@ -1,7 +1,7 @@
 """initial nexus schema
 
 Revision ID: 11d94d75e9a2
-Revises: 
+Revises:
 Create Date: 2026-11-23 12:53:23.681197
 """
 
