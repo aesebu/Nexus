@@ -108,6 +108,34 @@ PLANNED → DRAFT → REVIEW → APPROVED → DEVELOPMENT → TESTING → VALIDA
 
 A module must never be declared complete without test evidence. Every change must record a Change ID, Version, Reason, Impact Analysis, Approval, and Test Evidence.
 
+## MVP Implementation Status
+
+The initial implementation provides:
+
+- FastAPI modular monolith foundation
+- SQLite development database and PostgreSQL deployment configuration
+- JWT bearer authentication with tenant and role permissions
+- Command lifecycle with approval and execution states
+- Tenant-scoped audit events
+- Emergency stop activation and clearing
+- Docker and Docker Compose configuration
+- Pytest API coverage
+
+Start the local API:
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e ".[test]"
+uvicorn app.main:app --reload
+```
+
+Run tests:
+
+```bash
+pytest
+```
+
 ## License
 
 Not yet defined.
