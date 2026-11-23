@@ -1,0 +1,18 @@
+[
+  {
+    "name": "demo-chat-primary",
+    "provider": "openai-compatible",
+    "model_identifier": "replace-with-provider-chat-model-id",
+    "capabilities": ["chat"],
+    "status": "DISABLED",
+    "priority": 100
+  },
+  {
+    "name": "demo-chat-secondary",
+    "provider": "openai-compatible",
+    "model_identifier": "replace-with-another-chat-model-id",
+    "capabilities": ["chat"],
+    "status": "DISABLED",
+    "priority": 50
+  }
+]

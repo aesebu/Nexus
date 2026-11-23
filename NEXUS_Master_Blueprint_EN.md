@@ -17,7 +17,7 @@
 | Project Origin | Independent Greenfield |
 | External Blueprint Dependency | NONE |
 | Legacy Project Dependency | NONE |
-| Implementation Status | NOT STARTED |
+| Implementation Status | IN PROGRESS |
 | Approval Status | PENDING |
 
 ---
@@ -288,6 +288,25 @@ Security and governance system.
 
 ---
 
+### Current MVP Implementation Snapshot
+
+| Core Module | Implemented in MVP | Outstanding |
+|---|---|---|
+| CORE-01: Control Engine | Command lifecycle, system registry, task lifecycle, event journal, tenant configuration store | Background task workers, event broker/dispatch, runtime health monitoring, live configuration application |
+| CORE-02: AI Engine | OpenAI-compatible inference and NEXUS assistant chat with a fixed identity prompt and request-scoped messages | Persistent context, structured output, tool calling, response evaluation |
+| CORE-03: Model Intelligence | Tenant-scoped model registry and deterministic capability routing | Model discovery, evaluation, monitoring, additional provider adapters |
+| CORE-09: Security & Governance | Tenant RBAC, fail-closed command policies, payload-key approval rules, approval separation, audit, emergency stop, encrypted tenant secret store | Risk scoring, policy versioning, key rotation, external KMS |
+
+Registry status is administrative metadata and does not prove runtime health.
+The task API records lifecycle state but does not run tasks; the event journal
+stores and filters events but does not dispatch them. Tenant configuration is
+stored for management only and is not a secret store or a live runtime
+configuration source. Secret values are encrypted with an externally supplied
+application key and are not returned by the HTTP API; key rotation and external
+KMS integration remain outstanding.
+
+---
+
 ## 5. NEXUS SYSTEM MODULES
 
 ### 5.1 Agent Society
@@ -462,22 +481,22 @@ The system must provide:
 
 ## 10. DEVELOPMENT ROADMAP
 
-| Phase | Development | Deliverable |
-|---|---|---|
-| 00 | Project Foundation | Project Specification |
-| 01 | Supreme Architecture | Architecture Specification |
-| 02 | Authority & Governance | Governance Engine |
-| 03 | Core Foundation | Central Control |
-| 04 | AI Infrastructure | Model Intelligence |
-| 05 | AI Engine | Inference Engine |
-| 06 | Agent Intelligence | Agent Engine |
-| 07 | Memory & Knowledge | Knowledge Platform |
-| 08 | Intelligence Engine | Reasoning & Decision Support |
-| 09 | Automation | Workflow Engine |
-| 10 | NEXUS System | Operational Ecosystem |
-| 11 | Integration | Integrated Platform |
-| 12 | Production | Production Release |
-| 13 | Evolution | Continuous Improvement |
+| Phase | Development | Deliverable | Status |
+|---|---|---|---|
+| 00 | Project Foundation | Project Specification | Draft |
+| 01 | Supreme Architecture | Architecture Specification | Draft |
+| 02 | Authority & Governance | Governance Engine | In progress |
+| 03 | Core Foundation | Central Control | Complete (MVP) |
+| 04 | AI Infrastructure | Model Intelligence | Partial |
+| 05 | AI Engine | Inference Engine | Partial |
+| 06 | Agent Intelligence | Agent Engine | Planned |
+| 07 | Memory & Knowledge | Knowledge Platform | Planned |
+| 08 | Intelligence Engine | Reasoning & Decision Support | Planned |
+| 09 | Automation | Workflow Engine | Planned |
+| 10 | NEXUS System | Operational Ecosystem | Planned |
+| 11 | Integration | Integrated Platform | Planned |
+| 12 | Production | Production Release | Planned |
+| 13 | Evolution | Continuous Improvement | Planned |
 
 Every Phase must include Specification, Implementation, Testing, and Acceptance Criteria.
 
@@ -542,7 +561,7 @@ supported by a clear structure of authority and responsibility.
 | Project Origin | Independent Greenfield |
 | External Blueprint Dependency | NONE |
 | Legacy Project Dependency | NONE |
-| Implementation Status | NOT STARTED |
+| Implementation Status | IN PROGRESS |
 | Approval Status | PENDING |
 
 ---

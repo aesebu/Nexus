@@ -15,7 +15,7 @@ NEXUS is an advanced artificial intelligence system designed to serve as the cen
 | Document ID | NEXUS-SAI-MB-001 |
 | Version | 1.0 |
 | Status | DRAFT |
-| Implementation Status | NOT STARTED |
+| Implementation Status | IN PROGRESS |
 | Approval Status | PENDING |
 | Project Origin | Independent Greenfield |
 | External / Legacy Dependency | NONE |
@@ -77,28 +77,32 @@ Deployment: supports **Local, Cloud, and Hybrid**, with a Control Plane / Execut
 
 ## Development Roadmap
 
-| Phase | Focus | Deliverable |
-|---|---|---|
-| 00 | Project Foundation | Project Specification |
-| 01 | Supreme Architecture | Architecture Specification |
-| 02 | Authority & Governance | Governance Engine |
-| 03 | Core Foundation | Central Control |
-| 04 | AI Infrastructure | Model Intelligence |
-| 05 | AI Engine | Inference Engine |
-| 06 | Agent Intelligence | Agent Engine |
-| 07 | Memory & Knowledge | Knowledge Platform |
-| 08 | Intelligence Engine | Reasoning & Decision Support |
-| 09 | Automation | Workflow Engine |
-| 10 | NEXUS System | Operational Ecosystem |
-| 11 | Integration | Integrated Platform |
-| 12 | Production | Production Release |
-| 13 | Evolution | Continuous Improvement |
+| Phase | Focus | Deliverable | Status |
+|---|---|---|---|
+| 00 | Project Foundation | Project Specification | Draft |
+| 01 | Supreme Architecture | Architecture Specification | Draft |
+| 02 | Authority & Governance | Governance Engine | In progress |
+| 03 | Core Foundation | Central Control | Complete (MVP) |
+| 04 | AI Infrastructure | Model Intelligence | Partial |
+| 05 | AI Engine | Inference Engine | Partial |
+| 06 | Agent Intelligence | Agent Engine | Planned |
+| 07 | Memory & Knowledge | Knowledge Platform | Planned |
+| 08 | Intelligence Engine | Reasoning & Decision Support | Planned |
+| 09 | Automation | Workflow Engine | Planned |
+| 10 | NEXUS System | Operational Ecosystem | Planned |
+| 11 | Integration | Integrated Platform | Planned |
+| 12 | Production | Production Release | Planned |
+| 13 | Evolution | Continuous Improvement | Planned |
 
 ## Repository Contents
 
 | File | Description |
 |---|---|
 | [`NEXUS_Master_Blueprint_EN.md`](NEXUS_Master_Blueprint_EN.md) | Full master blueprint (English), covering all 13 sections |
+| [`docs/GOVERNANCE.md`](docs/GOVERNANCE.md) | Command policy and approval enforcement MVP |
+| [`docs/AI_ENGINE.md`](docs/AI_ENGINE.md) | AI inference, provider setup, registry, and authorization guide |
+| [`examples/nexus-api.http`](examples/nexus-api.http) | Sample model registry and inference requests |
+| [`examples/seed_models.json`](examples/seed_models.json) | Disabled placeholder models for optional development seeding |
 
 ## Development Governance
 
@@ -118,8 +122,31 @@ The initial implementation provides:
 - Command lifecycle with approval and execution states
 - Tenant-scoped audit events
 - Emergency stop activation and clearing
+- Tenant-scoped command policies with fail-closed defaults and payload-key approval rules
+- Separate creator/approver enforcement and policy audit snapshots
+- Tenant-scoped system registry with owner-managed lifecycle status
+- Tenant-scoped task lifecycle and emergency-stop enforcement
+- Event journal with source validation, filters, and audit records
+- Tenant-scoped configuration store for non-secret values
+- Tenant-scoped encrypted secret store with metadata-only API responses
+- Tenant-scoped AI model registry
+- Capability and provider-aware deterministic model routing
+- Model lifecycle status and priority configuration
+- OpenAI-compatible chat inference
+- NEXUS assistant chat endpoint with a fixed identity prompt and request-scoped context
+- Opt-in development model seed data
 - Docker and Docker Compose configuration
 - Pytest API coverage
+
+The task API manages lifecycle state only; it does not execute work in a
+background worker. The event journal stores and filters events but does not
+dispatch them through a broker. Tenant configuration values are stored for
+management but are not automatically applied to runtime settings; this store is
+not for credentials or other secrets. Secret writes require
+`NEXUS_SECRET_ENCRYPTION_KEY`; values are encrypted before persistence and are
+available to application code through the tenant-scoped resolver, not through
+the HTTP API. The encryption key is deployment-managed and not stored in the
+database. Key rotation and external KMS support are not implemented.
 
 Start the local API:
 

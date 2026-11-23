@@ -31,7 +31,11 @@ def client(db_session):
     app.dependency_overrides.clear()
 
 
-def token(role: str = "operator", tenant_id: str = "tenant-a", subject: str = "test-user") -> str:
+def token(
+    role: str = "operator",
+    tenant_id: str = "tenant-a",
+    subject: str = "test-user",
+) -> str:
     return jwt.encode(
         {"sub": subject, "role": role, "tenant_id": tenant_id},
         settings.jwt_secret,
@@ -39,8 +43,12 @@ def token(role: str = "operator", tenant_id: str = "tenant-a", subject: str = "t
     )
 
 
-def auth_headers(role: str = "operator", tenant_id: str = "tenant-a") -> dict[str, str]:
+def auth_headers(
+    role: str = "operator",
+    tenant_id: str = "tenant-a",
+    subject: str = "test-user",
+) -> dict[str, str]:
     return {
-        "Authorization": f"Bearer {token(role=role, tenant_id=tenant_id)}",
+        "Authorization": f"Bearer {token(role=role, tenant_id=tenant_id, subject=subject)}",
         "X-Tenant-ID": tenant_id,
     }

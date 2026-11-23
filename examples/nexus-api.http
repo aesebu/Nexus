@@ -1,0 +1,62 @@
+@baseUrl = http://localhost:8000
+@tenantId = demo
+@token = replace-with-a-valid-jwt
+
+### Register a model (disabled until its identifier is configured)
+POST {{baseUrl}}/api/v1/models
+Authorization: Bearer {{token}}
+X-Tenant-ID: {{tenantId}}
+Content-Type: application/json
+
+{
+  "name": "my-chat-model",
+  "provider": "openai-compatible",
+  "model_identifier": "replace-with-provider-chat-model-id",
+  "capabilities": ["chat"],
+  "status": "DISABLED",
+  "priority": 100
+}
+
+### List models for the tenant
+GET {{baseUrl}}/api/v1/models
+Authorization: Bearer {{token}}
+X-Tenant-ID: {{tenantId}}
+
+### Enable only after configuring a real provider model identifier
+PATCH {{baseUrl}}/api/v1/models/replace-with-model-id
+Authorization: Bearer {{token}}
+X-Tenant-ID: {{tenantId}}
+Content-Type: application/json
+
+{
+  "status": "ENABLED"
+}
+
+### Run chat inference after enabling a configured model
+POST {{baseUrl}}/api/v1/ai/infer
+Authorization: Bearer {{token}}
+X-Tenant-ID: {{tenantId}}
+Content-Type: application/json
+
+{
+  "messages": [
+    {"role": "system", "content": "Answer clearly and concisely."},
+    {"role": "user", "content": "What is NEXUS?"}
+  ],
+  "temperature": 0.2,
+  "max_tokens": 256
+}
+
+### Chat with the NEXUS assistant (messages are request-scoped)
+POST {{baseUrl}}/api/v1/nexus/chat
+Authorization: Bearer {{token}}
+X-Tenant-ID: {{tenantId}}
+Content-Type: application/json
+
+{
+  "messages": [
+    {"role": "user", "content": "What is NEXUS and what can it do today?"}
+  ],
+  "temperature": 0.2,
+  "max_tokens": 256
+}

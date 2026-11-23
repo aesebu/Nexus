@@ -1,4 +1,20 @@
 from tests.conftest import auth_headers
+from app.ai.providers import InferenceResult, OpenAICompatibleProvider
+from app.api.routes import get_inference_provider
+from app.core.config import Settings
+from app.main import app
+
+
+class StubInferenceProvider:
+    provider_name = "openai-compatible"
+
+    def generate(self, **kwargs):
+        self.request = kwargs
+        return InferenceResult(
+            content="Hello from the model",
+            input_tokens=8,
+            output_tokens=4,
+        )
 
 
 def test_health(client):
@@ -21,7 +37,7 @@ def test_command_lifecycle_and_audit(client):
 
     approved = client.post(
         f"/api/v1/commands/{command['id']}/approve",
-        headers=headers,
+        headers=auth_headers(subject="approver-user"),
     )
     assert approved.status_code == 200
     assert approved.json()["status"] == "APPROVED"
@@ -75,3 +91,964 @@ def test_tenant_isolation(client):
         headers=tenant_b,
     )
     assert denied.status_code == 404
+
+
+def test_viewer_can_read_command_but_not_cancel_it(client):
+    operator_headers = auth_headers(role="operator")
+    created = client.post(
+        "/api/v1/commands",
+        headers=operator_headers,
+        json={"type": "research", "payload": {}},
+    )
+    command_id = created.json()["id"]
+
+    viewed = client.get(
+        f"/api/v1/commands/{command_id}",
+        headers=auth_headers(role="viewer"),
+    )
+    assert viewed.status_code == 200
+
+    denied = client.post(
+        f"/api/v1/commands/{command_id}/cancel",
+        headers=auth_headers(role="viewer"),
+    )
+    assert denied.status_code == 403
+
+
+def test_cancel_command_lifecycle(client):
+    headers = auth_headers(role="operator")
+    created = client.post(
+        "/api/v1/commands",
+        headers=headers,
+        json={"type": "research", "payload": {}, "require_approval": False},
+    )
+    command_id = created.json()["id"]
+
+    cancelled = client.post(
+        f"/api/v1/commands/{command_id}/cancel",
+        headers=headers,
+    )
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "CANCELLED"
+
+    denied = client.post(
+        f"/api/v1/commands/{command_id}/approve",
+        headers=headers,
+    )
+    assert denied.status_code == 409
+
+
+def test_list_commands_is_tenant_scoped_and_filterable(client):
+    tenant_a_headers = auth_headers(role="viewer", tenant_id="tenant-a")
+
+    policy = client.post(
+        "/api/v1/policies/commands",
+        headers=auth_headers(role="owner", tenant_id="tenant-a"),
+        json={"command_type": "approved", "require_approval": False},
+    )
+    assert policy.status_code == 201
+
+    received = client.post(
+        "/api/v1/commands",
+        headers=auth_headers(role="operator", tenant_id="tenant-a"),
+        json={"type": "received", "payload": {}},
+    )
+    assert received.status_code == 201
+
+    approved = client.post(
+        "/api/v1/commands",
+        headers=auth_headers(role="operator", tenant_id="tenant-a"),
+        json={"type": "approved", "payload": {}, "require_approval": False},
+    )
+    assert approved.status_code == 201
+
+    client.post(
+        "/api/v1/commands",
+        headers=auth_headers(role="operator", tenant_id="tenant-b"),
+        json={"type": "other-tenant", "payload": {}},
+    )
+
+    tenant_a_commands = client.get(
+        "/api/v1/commands",
+        headers=tenant_a_headers,
+    )
+    assert tenant_a_commands.status_code == 200
+    assert {command["type"] for command in tenant_a_commands.json()} == {"received", "approved"}
+
+    approved_commands = client.get(
+        "/api/v1/commands?status=APPROVED",
+        headers=tenant_a_headers,
+    )
+    assert approved_commands.status_code == 200
+    assert len(approved_commands.json()) == 1
+    assert approved_commands.json()[0]["type"] == "approved"
+
+
+def test_unconfigured_command_fails_closed_and_requires_separate_approver(client):
+    creator_headers = auth_headers(role="operator", subject="creator")
+    created = client.post(
+        "/api/v1/commands",
+        headers=creator_headers,
+        json={
+            "type": "unconfigured",
+            "payload": {},
+            "require_approval": False,
+        },
+    )
+    assert created.status_code == 201
+    command = created.json()
+    assert command["status"] == "RECEIVED"
+
+    self_approval = client.post(
+        f"/api/v1/commands/{command['id']}/approve",
+        headers=creator_headers,
+    )
+    assert self_approval.status_code == 409
+
+    approved = client.post(
+        f"/api/v1/commands/{command['id']}/approve",
+        headers=auth_headers(role="operator", subject="different-operator"),
+    )
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "APPROVED"
+
+
+def test_command_policy_forces_approval_and_is_tenant_scoped(client):
+    owner_headers = auth_headers(role="owner", tenant_id="tenant-a")
+    policy = client.post(
+        "/api/v1/policies/commands",
+        headers=owner_headers,
+        json={
+            "command_type": "sensitive",
+            "require_approval": True,
+            "require_different_approver": True,
+            "description": "Sensitive operations require human approval.",
+        },
+    )
+    assert policy.status_code == 201
+    policy_id = policy.json()["id"]
+
+    duplicate = client.post(
+        "/api/v1/policies/commands",
+        headers=owner_headers,
+        json={"command_type": "sensitive"},
+    )
+    assert duplicate.status_code == 409
+
+    created = client.post(
+        "/api/v1/commands",
+        headers=auth_headers(role="operator", tenant_id="tenant-a"),
+        json={"type": "sensitive", "payload": {}, "require_approval": False},
+    )
+    assert created.status_code == 201
+    assert created.json()["status"] == "RECEIVED"
+
+    other_tenant_policy = client.get(
+        "/api/v1/policies/commands",
+        headers=auth_headers(role="owner", tenant_id="tenant-b"),
+    )
+    assert other_tenant_policy.status_code == 200
+    assert other_tenant_policy.json() == []
+
+    cross_tenant_update = client.patch(
+        f"/api/v1/policies/commands/{policy_id}",
+        headers=auth_headers(role="owner", tenant_id="tenant-b"),
+        json={"enabled": False},
+    )
+    assert cross_tenant_update.status_code == 404
+
+
+def test_only_owner_can_manage_command_policies(client):
+    operator_headers = auth_headers(role="operator", tenant_id="tenant-a")
+    created = client.post(
+        "/api/v1/policies/commands",
+        headers=operator_headers,
+        json={"command_type": "routine", "require_approval": False},
+    )
+    assert created.status_code == 403
+
+    viewer_read = client.get(
+        "/api/v1/policies/commands",
+        headers=auth_headers(role="viewer", tenant_id="tenant-a"),
+    )
+    assert viewer_read.status_code == 403
+
+
+def test_disabled_auto_approval_policy_fails_closed(client):
+    owner_headers = auth_headers(role="owner", tenant_id="tenant-a")
+    policy = client.post(
+        "/api/v1/policies/commands",
+        headers=owner_headers,
+        json={"command_type": "routine", "require_approval": False},
+    )
+    assert policy.status_code == 201
+
+    disabled = client.patch(
+        f"/api/v1/policies/commands/{policy.json()['id']}",
+        headers=owner_headers,
+        json={"enabled": False},
+    )
+    assert disabled.status_code == 200
+
+    invalid_update = client.patch(
+        f"/api/v1/policies/commands/{policy.json()['id']}",
+        headers=owner_headers,
+        json={"enabled": None},
+    )
+    assert invalid_update.status_code == 422
+
+    created = client.post(
+        "/api/v1/commands",
+        headers=auth_headers(role="operator", tenant_id="tenant-a"),
+        json={"type": "routine", "payload": {}, "require_approval": False},
+    )
+    assert created.status_code == 201
+    assert created.json()["status"] == "RECEIVED"
+
+
+def test_payload_policy_requires_approval_when_nested_key_is_present(client):
+    owner_headers = auth_headers(role="owner", tenant_id="tenant-a")
+    policy = client.post(
+        "/api/v1/policies/commands",
+        headers=owner_headers,
+        json={
+            "command_type": "transfer",
+            "require_approval": False,
+            "approval_payload_keys": ["destination.account"],
+        },
+    )
+    assert policy.status_code == 201
+    assert policy.json()["approval_payload_keys"] == ["destination.account"]
+
+    creator_headers = auth_headers(role="operator", tenant_id="tenant-a")
+    matched = client.post(
+        "/api/v1/commands",
+        headers=creator_headers,
+        json={
+            "type": "transfer",
+            "payload": {"destination": {"account": "account-123"}},
+            "require_approval": False,
+        },
+    )
+    assert matched.status_code == 201
+    assert matched.json()["status"] == "RECEIVED"
+
+    unmatched = client.post(
+        "/api/v1/commands",
+        headers=creator_headers,
+        json={
+            "type": "transfer",
+            "payload": {"destination": {}},
+            "require_approval": False,
+        },
+    )
+    assert unmatched.status_code == 201
+    assert unmatched.json()["status"] == "APPROVED"
+
+    audit = client.get("/api/v1/audit", headers=creator_headers)
+    command_audit = next(
+        event
+        for event in audit.json()
+        if event["resource_id"] == matched.json()["id"]
+        and event["action"] == "COMMAND_CREATED"
+    )
+    assert command_audit["detail"]["approval_payload_rule_matched"] is True
+    assert "account-123" not in str(command_audit["detail"])
+
+    updated = client.patch(
+        f"/api/v1/policies/commands/{policy.json()['id']}",
+        headers=owner_headers,
+        json={"approval_payload_keys": ["destination.routing_number"]},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["approval_payload_keys"] == ["destination.routing_number"]
+
+    old_rule_only = client.post(
+        "/api/v1/commands",
+        headers=creator_headers,
+        json={
+            "type": "transfer",
+            "payload": {"destination": {"account": "account-456"}},
+            "require_approval": False,
+        },
+    )
+    assert old_rule_only.status_code == 201
+    assert old_rule_only.json()["status"] == "APPROVED"
+
+    updated_rule_match = client.post(
+        "/api/v1/commands",
+        headers=creator_headers,
+        json={
+            "type": "transfer",
+            "payload": {"destination": {"routing_number": "route-789"}},
+            "require_approval": False,
+        },
+    )
+    assert updated_rule_match.status_code == 201
+    assert updated_rule_match.json()["status"] == "RECEIVED"
+
+    cleared = client.patch(
+        f"/api/v1/policies/commands/{policy.json()['id']}",
+        headers=owner_headers,
+        json={"approval_payload_keys": []},
+    )
+    assert cleared.status_code == 200
+    assert cleared.json()["approval_payload_keys"] == []
+
+
+def test_payload_policy_rejects_duplicate_and_invalid_paths(client):
+    headers = auth_headers(role="owner", tenant_id="tenant-a")
+    duplicate = client.post(
+        "/api/v1/policies/commands",
+        headers=headers,
+        json={
+            "command_type": "duplicate-path",
+            "approval_payload_keys": ["destination.account", "destination.account"],
+        },
+    )
+    assert duplicate.status_code == 422
+
+    invalid = client.post(
+        "/api/v1/policies/commands",
+        headers=headers,
+        json={
+            "command_type": "invalid-path",
+            "approval_payload_keys": ["destination..account"],
+        },
+    )
+    assert invalid.status_code == 422
+
+
+def test_system_registry_is_tenant_scoped_and_owner_managed(client):
+    owner_a = auth_headers(role="owner", tenant_id="tenant-a")
+    owner_b = auth_headers(role="owner", tenant_id="tenant-b")
+    registration = {
+        "name": "research-system",
+        "system_type": "agent-platform",
+        "version": "1.0",
+        "capabilities": ["research", "summarize"],
+        "description": "Development system registration",
+    }
+
+    created = client.post("/api/v1/systems", headers=owner_a, json=registration)
+    assert created.status_code == 201
+    system_id = created.json()["id"]
+    assert created.json()["status"] == "REGISTERED"
+
+    duplicate = client.post("/api/v1/systems", headers=owner_a, json=registration)
+    assert duplicate.status_code == 409
+
+    same_name_other_tenant = client.post(
+        "/api/v1/systems",
+        headers=owner_b,
+        json=registration,
+    )
+    assert same_name_other_tenant.status_code == 201
+
+    viewer_headers = auth_headers(role="viewer", tenant_id="tenant-a")
+    listed = client.get("/api/v1/systems", headers=viewer_headers)
+    assert listed.status_code == 200
+    assert [system["name"] for system in listed.json()] == ["research-system"]
+
+    denied_update = client.patch(
+        f"/api/v1/systems/{system_id}",
+        headers=viewer_headers,
+        json={"status": "ENABLED"},
+    )
+    assert denied_update.status_code == 403
+
+    enabled = client.patch(
+        f"/api/v1/systems/{system_id}",
+        headers=owner_a,
+        json={"status": "ENABLED"},
+    )
+    assert enabled.status_code == 200
+    assert enabled.json()["status"] == "ENABLED"
+
+    cross_tenant = client.get(
+        f"/api/v1/systems/{system_id}",
+        headers=owner_b,
+    )
+    assert cross_tenant.status_code == 404
+
+    audit = client.get("/api/v1/audit", headers=owner_a)
+    assert "SYSTEM_REGISTERED" in {event["action"] for event in audit.json()}
+    assert "SYSTEM_UPDATED" in {event["action"] for event in audit.json()}
+
+
+def test_system_registry_rejects_operator_write_and_null_capabilities(client):
+    operator_headers = auth_headers(role="operator", tenant_id="tenant-a")
+    denied = client.post(
+        "/api/v1/systems",
+        headers=operator_headers,
+        json={"name": "forbidden", "system_type": "agent"},
+    )
+    assert denied.status_code == 403
+
+    owner_headers = auth_headers(role="owner", tenant_id="tenant-a")
+    created = client.post(
+        "/api/v1/systems",
+        headers=owner_headers,
+        json={"name": "valid", "system_type": "agent"},
+    )
+    assert created.status_code == 201
+
+    invalid_update = client.patch(
+        f"/api/v1/systems/{created.json()['id']}",
+        headers=owner_headers,
+        json={"capabilities": None},
+    )
+    assert invalid_update.status_code == 422
+
+
+def test_task_lifecycle_and_audit(client):
+    headers = auth_headers(role="operator", tenant_id="tenant-a")
+    created = client.post(
+        "/api/v1/tasks",
+        headers=headers,
+        json={"title": "Review model output", "description": "Manual QA"},
+    )
+    assert created.status_code == 201
+    task = created.json()
+    assert task["status"] == "PENDING"
+
+    started = client.post(f"/api/v1/tasks/{task['id']}/start", headers=headers)
+    assert started.status_code == 200
+    assert started.json()["status"] == "IN_PROGRESS"
+    assert started.json()["started_at"] is not None
+
+    completed = client.post(
+        f"/api/v1/tasks/{task['id']}/complete",
+        headers=headers,
+        json={"result": "Review passed"},
+    )
+    assert completed.status_code == 200
+    assert completed.json()["status"] == "COMPLETED"
+    assert completed.json()["result"] == "Review passed"
+    assert completed.json()["finished_at"] is not None
+
+    invalid_restart = client.post(f"/api/v1/tasks/{task['id']}/start", headers=headers)
+    assert invalid_restart.status_code == 409
+
+    audit = client.get("/api/v1/audit", headers=headers)
+    actions = {event["action"] for event in audit.json()}
+    assert {"TASK_CREATED", "TASK_STARTED", "TASK_COMPLETED"} <= actions
+
+
+def test_task_failure_and_cancellation_transitions(client):
+    headers = auth_headers(role="operator", tenant_id="tenant-a")
+    failed_task = client.post(
+        "/api/v1/tasks",
+        headers=headers,
+        json={"title": "Failing task"},
+    ).json()
+    client.post(f"/api/v1/tasks/{failed_task['id']}/start", headers=headers)
+
+    failed = client.post(
+        f"/api/v1/tasks/{failed_task['id']}/fail",
+        headers=headers,
+        json={"reason": "Upstream dependency unavailable"},
+    )
+    assert failed.status_code == 200
+    assert failed.json()["status"] == "FAILED"
+    assert failed.json()["failure_reason"] == "Upstream dependency unavailable"
+
+    cancelled_task = client.post(
+        "/api/v1/tasks",
+        headers=headers,
+        json={"title": "Cancelled task"},
+    ).json()
+    cancelled = client.post(
+        f"/api/v1/tasks/{cancelled_task['id']}/cancel",
+        headers=headers,
+    )
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "CANCELLED"
+    assert cancelled.json()["finished_at"] is not None
+
+    invalid_cancel = client.post(
+        f"/api/v1/tasks/{cancelled_task['id']}/cancel",
+        headers=headers,
+    )
+    assert invalid_cancel.status_code == 409
+
+
+def test_tasks_are_tenant_scoped_and_viewer_read_only(client):
+    created = client.post(
+        "/api/v1/tasks",
+        headers=auth_headers(role="operator", tenant_id="tenant-a"),
+        json={"title": "Tenant A task"},
+    )
+    task_id = created.json()["id"]
+
+    viewer_headers = auth_headers(role="viewer", tenant_id="tenant-a")
+    listed = client.get("/api/v1/tasks?status=PENDING", headers=viewer_headers)
+    assert listed.status_code == 200
+    assert [task["id"] for task in listed.json()] == [task_id]
+
+    denied_create = client.post(
+        "/api/v1/tasks",
+        headers=viewer_headers,
+        json={"title": "Viewer cannot create"},
+    )
+    assert denied_create.status_code == 403
+
+    cross_tenant = client.get(
+        f"/api/v1/tasks/{task_id}",
+        headers=auth_headers(role="operator", tenant_id="tenant-b"),
+    )
+    assert cross_tenant.status_code == 404
+
+
+def test_emergency_stop_blocks_task_creation_and_start(client):
+    owner_headers = auth_headers(role="owner", tenant_id="tenant-a")
+    created = client.post(
+        "/api/v1/tasks",
+        headers=owner_headers,
+        json={"title": "Wait during stop"},
+    )
+    assert created.status_code == 201
+
+    activated = client.post("/api/v1/emergency-stop", headers=owner_headers)
+    assert activated.status_code == 200
+
+    blocked_start = client.post(
+        f"/api/v1/tasks/{created.json()['id']}/start",
+        headers=owner_headers,
+    )
+    assert blocked_start.status_code == 409
+
+    blocked_create = client.post(
+        "/api/v1/tasks",
+        headers=owner_headers,
+        json={"title": "Blocked task"},
+    )
+    assert blocked_create.status_code == 409
+
+
+def test_event_journal_filters_events_and_validates_enabled_source(client):
+    owner_headers = auth_headers(role="owner", tenant_id="tenant-a")
+    registered = client.post(
+        "/api/v1/systems",
+        headers=owner_headers,
+        json={"name": "event-source", "system_type": "integration"},
+    )
+    source_id = registered.json()["id"]
+    enabled = client.patch(
+        f"/api/v1/systems/{source_id}",
+        headers=owner_headers,
+        json={"status": "ENABLED"},
+    )
+    assert enabled.status_code == 200
+
+    operator_headers = auth_headers(role="operator", tenant_id="tenant-a")
+    published = client.post(
+        "/api/v1/events",
+        headers=operator_headers,
+        json={
+            "event_type": "integration.sync.completed",
+            "source_system_id": source_id,
+            "payload": {"records": 12, "ok": True},
+        },
+    )
+    assert published.status_code == 201
+    event = published.json()
+    assert event["payload"] == {"records": 12, "ok": True}
+
+    filtered = client.get(
+        "/api/v1/events?event_type=integration.sync.completed",
+        headers=operator_headers,
+    )
+    assert filtered.status_code == 200
+    assert [item["id"] for item in filtered.json()] == [event["id"]]
+
+    viewer_read = client.get(
+        "/api/v1/events",
+        headers=auth_headers(role="viewer", tenant_id="tenant-a"),
+    )
+    assert viewer_read.status_code == 403
+
+    audit = client.get("/api/v1/audit", headers=operator_headers)
+    event_audit = next(
+        entry for entry in audit.json() if entry["action"] == "EVENT_PUBLISHED"
+    )
+    assert event_audit["detail"] == {
+        "event_type": "integration.sync.completed",
+        "source_system_id": source_id,
+    }
+
+
+def test_event_journal_rejects_unavailable_sources_and_oversized_payloads(client):
+    headers = auth_headers(role="operator", tenant_id="tenant-a")
+    not_found = client.post(
+        "/api/v1/events",
+        headers=headers,
+        json={
+            "event_type": "integration.failed",
+            "source_system_id": "00000000-0000-0000-0000-000000000000",
+            "payload": {},
+        },
+    )
+    assert not_found.status_code == 404
+
+    oversized = client.post(
+        "/api/v1/events",
+        headers=headers,
+        json={
+            "event_type": "integration.payload",
+            "payload": {"content": "x" * (64 * 1024)},
+        },
+    )
+    assert oversized.status_code == 422
+
+
+def test_tenant_configuration_upsert_access_and_delete(client):
+    owner_a = auth_headers(role="owner", tenant_id="tenant-a")
+    owner_b = auth_headers(role="owner", tenant_id="tenant-b")
+    first = client.put(
+        "/api/v1/config",
+        headers=owner_a,
+        json={"key": "runtime.max_retries", "value": 3},
+    )
+    assert first.status_code == 200
+    config_id = first.json()["id"]
+    assert first.json()["value"] == 3
+
+    updated = client.put(
+        "/api/v1/config",
+        headers=owner_a,
+        json={"key": "runtime.max_retries", "value": 5},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["id"] == config_id
+    assert updated.json()["value"] == 5
+
+    operator_headers = auth_headers(role="operator", tenant_id="tenant-a")
+    listed = client.get("/api/v1/config", headers=operator_headers)
+    assert listed.status_code == 200
+    assert listed.json()[0]["key"] == "runtime.max_retries"
+    assert listed.json()[0]["value"] == 5
+
+    viewer_read = client.get(
+        "/api/v1/config",
+        headers=auth_headers(role="viewer", tenant_id="tenant-a"),
+    )
+    assert viewer_read.status_code == 403
+
+    denied_write = client.put(
+        "/api/v1/config",
+        headers=operator_headers,
+        json={"key": "runtime.max_retries", "value": 6},
+    )
+    assert denied_write.status_code == 403
+
+    other_tenant_list = client.get("/api/v1/config", headers=owner_b)
+    assert other_tenant_list.status_code == 200
+    assert other_tenant_list.json() == []
+    cross_tenant_get = client.get(
+        f"/api/v1/config/{config_id}",
+        headers=owner_b,
+    )
+    assert cross_tenant_get.status_code == 404
+
+    audit = client.get("/api/v1/audit", headers=operator_headers)
+    config_events = [
+        event for event in audit.json() if event["action"].startswith("CONFIGURATION_")
+    ]
+    assert {event["action"] for event in config_events} == {
+        "CONFIGURATION_CREATED",
+        "CONFIGURATION_UPDATED",
+    }
+    assert all("value" not in event["detail"] for event in config_events)
+
+    deleted = client.delete(f"/api/v1/config/{config_id}", headers=owner_a)
+    assert deleted.status_code == 204
+    missing = client.get(f"/api/v1/config/{config_id}", headers=owner_a)
+    assert missing.status_code == 404
+
+
+def test_tenant_configuration_rejects_secret_keys_and_invalid_values(client):
+    owner_headers = auth_headers(role="owner", tenant_id="tenant-a")
+    secret_key = client.put(
+        "/api/v1/config",
+        headers=owner_headers,
+        json={"key": "provider.api_key", "value": "do-not-store"},
+    )
+    assert secret_key.status_code == 422
+
+    null_value = client.put(
+        "/api/v1/config",
+        headers=owner_headers,
+        json={"key": "runtime.enabled", "value": None},
+    )
+    assert null_value.status_code == 422
+
+    oversized_value = client.put(
+        "/api/v1/config",
+        headers=owner_headers,
+        json={"key": "runtime.large", "value": "x" * (32 * 1024)},
+    )
+    assert oversized_value.status_code == 422
+
+
+def test_model_registry_and_routing(client):
+    owner_headers = auth_headers(role="owner", tenant_id="tenant-a")
+
+    first = client.post(
+        "/api/v1/models",
+        headers=owner_headers,
+        json={
+            "name": "general-low",
+            "provider": "openai",
+            "model_identifier": "gpt-general-low",
+            "capabilities": ["chat", "summarize"],
+            "priority": 10,
+        },
+    )
+    assert first.status_code == 201
+
+    selected = client.post(
+        "/api/v1/models",
+        headers=owner_headers,
+        json={
+            "name": "reasoning-high",
+            "provider": "anthropic",
+            "model_identifier": "claude-reasoning",
+            "capabilities": ["chat", "reason"],
+            "priority": 100,
+        },
+    )
+    assert selected.status_code == 201
+
+    route = client.post(
+        "/api/v1/models/route",
+        headers=owner_headers,
+        json={"capability": "chat"},
+    )
+    assert route.status_code == 200
+    assert route.json()["name"] == "reasoning-high"
+
+    provider_route = client.post(
+        "/api/v1/models/route",
+        headers=owner_headers,
+        json={"capability": "chat", "provider": "openai"},
+    )
+    assert provider_route.status_code == 200
+    assert provider_route.json()["name"] == "general-low"
+
+
+def test_model_routing_tenant_isolation_and_disabled_status(client):
+    owner_a = auth_headers(role="owner", tenant_id="tenant-a")
+    owner_b = auth_headers(role="owner", tenant_id="tenant-b")
+
+    created = client.post(
+        "/api/v1/models",
+        headers=owner_a,
+        json={
+            "name": "tenant-a-model",
+            "provider": "local",
+            "model_identifier": "local-a",
+            "capabilities": ["embed"],
+            "priority": 50,
+        },
+    )
+    assert created.status_code == 201
+    model_id = created.json()["id"]
+
+    disabled = client.patch(
+        f"/api/v1/models/{model_id}",
+        headers=owner_a,
+        json={"status": "DISABLED"},
+    )
+    assert disabled.status_code == 200
+    assert disabled.json()["status"] == "DISABLED"
+
+    no_route = client.post(
+        "/api/v1/models/route",
+        headers=owner_a,
+        json={"capability": "embed"},
+    )
+    assert no_route.status_code == 404
+
+    other_tenant = client.post(
+        "/api/v1/models/route",
+        headers=owner_b,
+        json={"capability": "embed"},
+    )
+    assert other_tenant.status_code == 404
+
+
+def test_viewer_cannot_create_or_update_models(client):
+    viewer_headers = auth_headers(role="viewer", tenant_id="tenant-a")
+
+    created = client.post(
+        "/api/v1/models",
+        headers=viewer_headers,
+        json={
+            "name": "forbidden",
+            "provider": "local",
+            "model_identifier": "forbidden",
+        },
+    )
+    assert created.status_code == 403
+
+
+def test_ai_inference_uses_registered_model_and_audits_without_prompt(client):
+    headers = auth_headers(role="operator", tenant_id="tenant-a")
+    registered = client.post(
+        "/api/v1/models",
+        headers=headers,
+        json={
+            "name": "chat-primary",
+            "provider": "openai-compatible",
+            "model_identifier": "chat-model-v1",
+            "capabilities": ["chat"],
+            "priority": 50,
+        },
+    )
+    assert registered.status_code == 201
+
+    provider = StubInferenceProvider()
+    app.dependency_overrides[get_inference_provider] = lambda: provider
+    response = client.post(
+        "/api/v1/ai/infer",
+        headers=headers,
+        json={
+            "messages": [{"role": "user", "content": "sensitive prompt"}],
+            "temperature": 0.2,
+            "max_tokens": 64,
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["content"] == "Hello from the model"
+    assert provider.request["model_identifier"] == "chat-model-v1"
+    assert provider.request["temperature"] == 0.2
+
+    audit = client.get("/api/v1/audit", headers=headers)
+    inference_event = next(
+        event for event in audit.json() if event["action"] == "AI_INFERENCE_COMPLETED"
+    )
+    assert "sensitive prompt" not in str(inference_event["detail"])
+
+
+def test_nexus_chat_adds_fixed_identity_prompt_and_uses_request_context(client):
+    headers = auth_headers(role="operator", tenant_id="tenant-a")
+    registered = client.post(
+        "/api/v1/models",
+        headers=headers,
+        json={
+            "name": "chat-primary",
+            "provider": "openai-compatible",
+            "model_identifier": "chat-model-v1",
+            "capabilities": ["chat"],
+            "priority": 50,
+        },
+    )
+    assert registered.status_code == 201
+
+    provider = StubInferenceProvider()
+    app.dependency_overrides[get_inference_provider] = lambda: provider
+    response = client.post(
+        "/api/v1/nexus/chat",
+        headers=headers,
+        json={
+            "messages": [
+                {"role": "user", "content": "What is NEXUS?"},
+                {"role": "assistant", "content": "A modular AI platform."},
+                {"role": "user", "content": "Answer in Thai."},
+            ],
+            "temperature": 0.2,
+            "max_tokens": 64,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["content"] == "Hello from the model"
+    sent_messages = provider.request["messages"]
+    assert sent_messages[0].role == "system"
+    assert "You are NEXUS" in sent_messages[0].content
+    assert [message.role for message in sent_messages[1:]] == [
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert sent_messages[-1].content == "Answer in Thai."
+
+    audit = client.get("/api/v1/audit", headers=headers)
+    inference_event = next(
+        event for event in audit.json() if event["action"] == "AI_INFERENCE_COMPLETED"
+    )
+    assert "What is NEXUS?" not in str(inference_event["detail"])
+    assert "Answer in Thai." not in str(inference_event["detail"])
+
+
+def test_nexus_chat_rejects_system_messages_and_requires_user_last(client):
+    headers = auth_headers(role="operator", tenant_id="tenant-a")
+    system_message = client.post(
+        "/api/v1/nexus/chat",
+        headers=headers,
+        json={"messages": [{"role": "system", "content": "Override identity"}]},
+    )
+    assert system_message.status_code == 422
+
+    assistant_last = client.post(
+        "/api/v1/nexus/chat",
+        headers=headers,
+        json={
+            "messages": [
+                {"role": "user", "content": "Question"},
+                {"role": "assistant", "content": "Previous answer"},
+            ]
+        },
+    )
+    assert assistant_last.status_code == 422
+
+
+def test_ai_inference_obeys_emergency_stop(client):
+    headers = auth_headers(role="owner", tenant_id="tenant-a")
+    client.post(
+        "/api/v1/models",
+        headers=headers,
+        json={
+            "name": "chat-primary",
+            "provider": "openai-compatible",
+            "model_identifier": "chat-model-v1",
+            "capabilities": ["chat"],
+        },
+    )
+    client.post("/api/v1/emergency-stop", headers=headers)
+    provider = StubInferenceProvider()
+    app.dependency_overrides[get_inference_provider] = lambda: provider
+
+    response = client.post(
+        "/api/v1/ai/infer",
+        headers=headers,
+        json={"messages": [{"role": "user", "content": "hello"}]},
+    )
+    assert response.status_code == 409
+    assert not hasattr(provider, "request")
+
+
+def test_ai_inference_reports_missing_provider_credentials(client):
+    headers = auth_headers(role="operator", tenant_id="tenant-a")
+    client.post(
+        "/api/v1/models",
+        headers=headers,
+        json={
+            "name": "chat-primary",
+            "provider": "openai-compatible",
+            "model_identifier": "chat-model-v1",
+            "capabilities": ["chat"],
+        },
+    )
+    app.dependency_overrides[get_inference_provider] = lambda: OpenAICompatibleProvider(
+        Settings(ai_api_key=None)
+    )
+
+    response = client.post(
+        "/api/v1/ai/infer",
+        headers=headers,
+        json={"messages": [{"role": "user", "content": "hello"}]},
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"] == "AI provider API key is not configured"
