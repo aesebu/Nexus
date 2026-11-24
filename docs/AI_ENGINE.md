@@ -1,8 +1,10 @@
 # AI Engine: Inference and Model Registry
 
-The current AI Engine MVP accepts chat messages, routes them to a registered
-model, and calls an OpenAI-compatible chat-completions endpoint. Provider
-credentials are read from environment settings; prompts are not persisted.
+The AI Engine accepts chat messages, routes them to a registered model, and
+calls an OpenAI-compatible chat-completions endpoint. It supports optional
+tenant/actor-scoped conversation persistence, JSON structured output, and
+provider tool-call declarations. Provider credentials are read from environment
+settings.
 
 ## Configure the provider
 
@@ -78,14 +80,60 @@ Use `POST /api/v1/nexus/chat` for the NEXUS-branded assistant. It uses the
 same tenant model routing, provider configuration, authorization, emergency
 stop, and audit behavior as `/api/v1/ai/infer`, and prepends a fixed NEXUS
 identity prompt. Supply only `user` and `assistant` messages; the final message
-must be from the user. Conversation messages are request-scoped and are not
-stored by NEXUS. Clients that need conversation continuity must send the
-relevant prior messages again.
+must be from the user. By default, conversation messages are request-scoped.
+For durable context, create a conversation and pass its `conversation_id`.
 
 The assistant prompt sets identity and response expectations; it is not an
-authorization boundary. The assistant does not have tools or direct access to
-tenant data or live system state, and it cannot execute commands. API
-permissions and governance policies remain enforced by the application.
+authorization boundary. The assistant has no built-in access to tenant data or live system
+state. Optional tool schemas can be passed, but tool calls are returned as
+metadata only and are never executed by the assistant endpoint. API permissions
+and governance policies remain enforced by the application.
+
+## Persistent conversations
+
+Create a tenant/actor-scoped conversation before inference:
+
+```http
+POST /api/v1/ai/conversations
+Content-Type: application/json
+
+{"title":"Planning"}
+```
+
+Pass the returned `conversation_id` on `/ai/infer` requests. NEXUS adds prior
+stored messages to the provider context, persists the submitted user/assistant
+messages and the assistant response, and limits context loading to 100 stored
+messages. Conversations cannot be read or deleted by another actor or tenant.
+Use `GET /api/v1/ai/conversations/{conversation_id}/messages` to inspect history
+and `DELETE /api/v1/ai/conversations/{conversation_id}` to remove it.
+
+Prompts and responses are stored in conversation history. This is user data:
+operators must apply database access controls and retention procedures.
+
+## Structured output and tools
+
+An inference request may include `response_format` for JSON output:
+
+```json
+{
+  "messages":[{"role":"user","content":"Return a JSON status"}],
+  "response_format":{"type":"json_object"}
+}
+```
+
+For a named JSON Schema, use:
+
+```json
+{
+  "type":"json_schema",
+  "json_schema":{"name":"status","schema":{"type":"object"}}
+}
+```
+
+Tool declarations may be supplied with `tools`. Provider-declared tool calls
+are returned in `tool_calls`; NEXUS does not execute tools automatically.
+Execution, authorization, and audit of any tool call must happen in a separate
+application/governance workflow.
 
 ## Development seed data
 

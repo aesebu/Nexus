@@ -51,7 +51,7 @@ Autonomy levels run from **L0 Read Only** through **L5 Strategic Autonomous Oper
 | CORE-02 | AI Engine — inference and context |
 | CORE-03 | Model Intelligence — model registry and routing |
 | CORE-04 | Agent Engine — agent lifecycle and orchestration |
-| CORE-05 | Memory & Knowledge Engine — memory layers and knowledge graph |
+| CORE-05 | Memory & Knowledge Engine — knowledge repository, source registry, and future memory/graph layers |
 | CORE-06 | Intelligence Engine — reasoning and decision support |
 | CORE-07 | Automation Engine — workflows and scheduling |
 | CORE-08 | Data & Administration — data, identity, tenants, audit |
@@ -63,7 +63,7 @@ Autonomy levels run from **L0 Read Only** through **L5 Strategic Autonomous Oper
 |---|---|
 | Frontend | React / TypeScript |
 | Backend | Python / FastAPI |
-| Database | PostgreSQL |
+| Database | SQLite for development; PostgreSQL for deployment |
 | ORM / Migration | SQLAlchemy / Alembic |
 | API | REST |
 | Authentication | JWT / RBAC |
@@ -84,11 +84,11 @@ Deployment: supports **Local, Cloud, and Hybrid**, with a Control Plane / Execut
 | 02 | Authority & Governance | Governance Engine | Complete (validated) |
 | 03 | Core Foundation | Central Control | Complete (MVP) |
 | 04 | AI Infrastructure | Model Intelligence | Complete (validated) |
-| 05 | AI Engine | Inference Engine | Partial |
-| 06 | Agent Intelligence | Agent Engine | Planned |
-| 07 | Memory & Knowledge | Knowledge Platform | Planned |
-| 08 | Intelligence Engine | Reasoning & Decision Support | Planned |
-| 09 | Automation | Workflow Engine | Planned |
+| 05 | AI Engine | Inference Engine | Complete (MVP) |
+| 06 | Agent Intelligence | Agent Engine | Complete (MVP) |
+| 07 | Memory & Knowledge | Knowledge Repository and Source Registry | Complete (MVP) |
+| 08 | Intelligence Engine | Reasoning & Decision Support | Complete (MVP) |
+| 09 | Automation | Workflow Engine | Complete (MVP) |
 | 10 | NEXUS System | Operational Ecosystem | Planned |
 | 11 | Integration | Integrated Platform | Planned |
 | 12 | Production | Production Release | Planned |
@@ -104,6 +104,15 @@ Deployment: supports **Local, Cloud, and Hybrid**, with a Control Plane / Execut
 | [`docs/PHASE_00_PROJECT_FOUNDATION.md`](docs/PHASE_00_PROJECT_FOUNDATION.md) | Phase 00 specification, implementation, acceptance criteria, and test evidence |
 | [`docs/PHASE_01_SUPREME_ARCHITECTURE.md`](docs/PHASE_01_SUPREME_ARCHITECTURE.md) | Phase 01 three-tier architecture, boundaries, flows, deployment, and acceptance criteria |
 | [`docs/PHASE_02_AUTHORITY_AND_GOVERNANCE.md`](docs/PHASE_02_AUTHORITY_AND_GOVERNANCE.md) | Phase 02 authority model, governance decisions, audit evidence, and acceptance criteria |
+| [`docs/PHASE_05_AI_ENGINE.md`](docs/PHASE_05_AI_ENGINE.md) | Phase 05 AI Engine specification, implementation, boundaries, and acceptance criteria |
+| [`docs/PHASE_06_AGENT_ENGINE.md`](docs/PHASE_06_AGENT_ENGINE.md) | Phase 06 agent registry, lifecycle, orchestration, security boundaries, and acceptance criteria |
+| [`docs/AGENT_ENGINE.md`](docs/AGENT_ENGINE.md) | Agent Engine API and operations guide |
+| [`docs/PHASE_07_MEMORY_KNOWLEDGE.md`](docs/PHASE_07_MEMORY_KNOWLEDGE.md) | Phase 07 knowledge repository, source registry, lexical retrieval, security boundaries, and acceptance criteria |
+| [`docs/KNOWLEDGE_ENGINE.md`](docs/KNOWLEDGE_ENGINE.md) | Knowledge Engine API and operations guide |
+| [`docs/PHASE_08_INTELLIGENCE_ENGINE.md`](docs/PHASE_08_INTELLIGENCE_ENGINE.md) | Phase 08 deterministic decision-support specification, rules, and acceptance criteria |
+| [`docs/INTELLIGENCE_ENGINE.md`](docs/INTELLIGENCE_ENGINE.md) | Intelligence Engine API and operations guide |
+| [`docs/PHASE_09_AUTOMATION_WORKFLOWS.md`](docs/PHASE_09_AUTOMATION_WORKFLOWS.md) | Phase 09 automation workflow scope, execution semantics, boundaries, and acceptance criteria |
+| [`docs/AUTOMATION_WORKFLOWS.md`](docs/AUTOMATION_WORKFLOWS.md) | Automation workflow API and operations guide |
 | [`examples/nexus-api.http`](examples/nexus-api.http) | Sample model registry and inference requests |
 | [`examples/seed_models.json`](examples/seed_models.json) | Disabled placeholder models for optional development seeding |
 
@@ -136,7 +145,13 @@ The initial implementation provides:
 - Capability and provider-aware deterministic model routing
 - Model lifecycle status and priority configuration
 - OpenAI-compatible chat inference
+- Persistent conversation context, structured JSON output, and tool-call declarations
 - NEXUS assistant chat endpoint with a fixed identity prompt and request-scoped context
+- Tenant-scoped AI agent registry, lifecycle management, explicit invocation, and bounded orchestration
+- Tenant-scoped versioned knowledge documents with lexical chunk retrieval
+- Tenant-scoped knowledge source registry with credibility, license, access, verification, and lifecycle metadata
+- Deterministic, tenant-scoped weighted decision assessments with separate risk analysis
+- Tenant-scoped, versioned AI inference workflows with delayed runs and resumable worker execution
 - Opt-in development model seed data
 - Docker and Docker Compose configuration
 - Pytest API coverage
@@ -172,15 +187,17 @@ Use `/health/live` for process liveness and `/health/ready` for database
 readiness. `/health` remains available as a compatibility endpoint.
 
 Manual tasks continue to use the task lifecycle endpoints. Tasks created with
-`work_type: "ai.inference"` are claimed by the separate worker process, routed
-to an enabled chat model for the same tenant, and completed with a JSON
-`InferenceResponse` in the task's `result`. Configure an enabled chat model and
-`NEXUS_AI_API_KEY` before submitting inference tasks. The worker uses database
-leases and retries transient provider failures up to three attempts; processing
-is at-least-once, so a provider timeout can cause a repeated request. Emergency
-stop prevents new tasks from being claimed. Inference prompts and results are
-stored unencrypted in the application database; results are visible through
-tenant-scoped task reads, so do not include secret values. The event journal
+`work_type: "ai.inference"` and active automation workflow runs are claimed by
+the separate worker process and routed to enabled chat models for the same
+tenant. Configure an enabled chat model and `NEXUS_AI_API_KEY` before
+submitting inference work. The worker uses database leases and retries
+transient provider failures up to three attempts; processing is at-least-once,
+so a provider timeout can cause a repeated request. Workflow runs snapshot
+their definition and persist each completed step to resume after retries.
+Emergency stop prevents new tasks from being claimed. Inference prompts,
+workflow inputs, and results are stored unencrypted in the application
+database; results are visible through tenant-scoped reads, so do not include
+secret values. The event journal
 stores and filters events but does not dispatch them through a broker. Tenant
 configuration values are stored for management but are not automatically
 applied to runtime settings; this store is not for credentials or other
@@ -205,9 +222,10 @@ For local background execution, run the worker in a second terminal:
 python -m app.worker
 ```
 
-Docker Compose starts the worker alongside the API. To enqueue an inference
-task, post a task with `work_type: "ai.inference"` and `work_payload` matching
-the `/api/v1/ai/infer` request body.
+Docker Compose starts the worker alongside the API. To enqueue an inference task, post a task with `work_type: "ai.inference"` and
+`work_payload` matching the `/api/v1/ai/infer` request body. For workflows,
+create and activate one through `/api/v1/workflows`, then queue a run through
+`/api/v1/workflows/{workflow_id}/runs`.
 
 Run tests:
 

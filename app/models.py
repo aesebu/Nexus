@@ -43,6 +43,33 @@ class RegistryStatus(str, enum.Enum):
     DISABLED = "DISABLED"
 
 
+class AgentStatus(str, enum.Enum):
+    REGISTERED = "REGISTERED"
+    ENABLED = "ENABLED"
+    DISABLED = "DISABLED"
+
+
+class KnowledgeDocumentStatus(str, enum.Enum):
+    DRAFT = "DRAFT"
+    ACTIVE = "ACTIVE"
+    INACTIVE = "INACTIVE"
+
+
+class KnowledgeSourceStatus(str, enum.Enum):
+    DISCOVERED = "DISCOVERED"
+    VERIFIED = "VERIFIED"
+    RESTRICTED = "RESTRICTED"
+    DEPRECATED = "DEPRECATED"
+
+
+class KnowledgeSourceCredibility(str, enum.Enum):
+    S1 = "S1"
+    S2 = "S2"
+    S3 = "S3"
+    S4 = "S4"
+    S5 = "S5"
+
+
 class TaskStatus(str, enum.Enum):
     PENDING = "PENDING"
     IN_PROGRESS = "IN_PROGRESS"
@@ -290,6 +317,256 @@ class AIModel(Base):
         DateTime(timezone=True), nullable=True
     )
     health_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class AIConversation(Base):
+    __tablename__ = "ai_conversations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    created_by: Mapped[str] = mapped_column(String(128), index=True)
+    title: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class AIConversationMessage(Base):
+    __tablename__ = "ai_conversation_messages"
+    __table_args__ = (
+        UniqueConstraint(
+            "conversation_id",
+            "sequence",
+            name="uq_ai_conversation_message_sequence",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    conversation_id: Mapped[str] = mapped_column(
+        ForeignKey("ai_conversations.id", ondelete="CASCADE"), index=True
+    )
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    sequence: Mapped[int] = mapped_column()
+    role: Mapped[str] = mapped_column(String(32))
+    content: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AIAgent(Base):
+    __tablename__ = "ai_agents"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "name", name="uq_ai_agent_tenant_name"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    name: Mapped[str] = mapped_column(String(128))
+    agent_type: Mapped[str] = mapped_column(String(64), index=True)
+    description: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    instructions: Mapped[str] = mapped_column(Text)
+    capabilities: Mapped[list[str]] = mapped_column(JSON, default=list)
+    tools: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    preferred_provider: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    status: Mapped[AgentStatus] = mapped_column(
+        Enum(AgentStatus), default=AgentStatus.REGISTERED, index=True
+    )
+    created_by: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class KnowledgeDocument(Base):
+    __tablename__ = "knowledge_documents"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "name", name="uq_knowledge_document_tenant_name"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    name: Mapped[str] = mapped_column(String(200))
+    description: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    source: Mapped[str] = mapped_column(String(500))
+    status: Mapped[KnowledgeDocumentStatus] = mapped_column(
+        Enum(KnowledgeDocumentStatus),
+        default=KnowledgeDocumentStatus.DRAFT,
+        index=True,
+    )
+    current_version: Mapped[int] = mapped_column(default=1)
+    created_by: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class KnowledgeDocumentVersion(Base):
+    __tablename__ = "knowledge_document_versions"
+    __table_args__ = (
+        UniqueConstraint(
+            "document_id",
+            "version",
+            name="uq_knowledge_document_version",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    document_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_documents.id", ondelete="CASCADE"), index=True
+    )
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    version: Mapped[int] = mapped_column()
+    content: Mapped[str] = mapped_column(Text)
+    created_by: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class KnowledgeChunk(Base):
+    __tablename__ = "knowledge_chunks"
+    __table_args__ = (
+        UniqueConstraint(
+            "document_version_id",
+            "chunk_index",
+            name="uq_knowledge_chunk_version_index",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    document_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_documents.id", ondelete="CASCADE"), index=True
+    )
+    document_version_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_document_versions.id", ondelete="CASCADE"), index=True
+    )
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    chunk_index: Mapped[int] = mapped_column()
+    start_offset: Mapped[int] = mapped_column()
+    end_offset: Mapped[int] = mapped_column()
+    content: Mapped[str] = mapped_column(Text)
+
+
+class KnowledgeSource(Base):
+    __tablename__ = "knowledge_sources"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "name", name="uq_knowledge_source_tenant_name"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    name: Mapped[str] = mapped_column(String(200))
+    url: Mapped[str | None] = mapped_column(String(2_048), nullable=True)
+    source_type: Mapped[str] = mapped_column(String(64))
+    knowledge_domains: Mapped[list[str]] = mapped_column(JSON, default=list)
+    credibility: Mapped[KnowledgeSourceCredibility] = mapped_column(
+        Enum(KnowledgeSourceCredibility),
+        default=KnowledgeSourceCredibility.S5,
+        index=True,
+    )
+    status: Mapped[KnowledgeSourceStatus] = mapped_column(
+        Enum(KnowledgeSourceStatus),
+        default=KnowledgeSourceStatus.DISCOVERED,
+        index=True,
+    )
+    access_method: Mapped[str] = mapped_column(String(64))
+    license: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    update_frequency: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    security_risk: Mapped[str] = mapped_column(String(500), default="NOT_ASSESSED")
+    research_status: Mapped[str] = mapped_column(String(64), default="PENDING")
+    last_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_by: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class IntelligenceAssessment(Base):
+    __tablename__ = "intelligence_assessments"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    title: Mapped[str] = mapped_column(String(200))
+    objective: Mapped[str] = mapped_column(Text)
+    input_snapshot: Mapped[dict] = mapped_column(JSON)
+    result_snapshot: Mapped[dict] = mapped_column(JSON)
+    created_by: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AutomationWorkflowStatus(str, enum.Enum):
+    DRAFT = "DRAFT"
+    ACTIVE = "ACTIVE"
+    INACTIVE = "INACTIVE"
+
+
+class AutomationWorkflowRunStatus(str, enum.Enum):
+    QUEUED = "QUEUED"
+    IN_PROGRESS = "IN_PROGRESS"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class AutomationWorkflow(Base):
+    __tablename__ = "automation_workflows"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "name",
+            name="uq_automation_workflow_tenant_name",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    name: Mapped[str] = mapped_column(String(128))
+    description: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    steps: Mapped[list[dict]] = mapped_column(JSON)
+    version: Mapped[int] = mapped_column(default=1)
+    status: Mapped[AutomationWorkflowStatus] = mapped_column(
+        Enum(AutomationWorkflowStatus),
+        default=AutomationWorkflowStatus.DRAFT,
+        index=True,
+    )
+    created_by: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class AutomationWorkflowRun(Base):
+    __tablename__ = "automation_workflow_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("control_tasks.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    workflow_id: Mapped[str] = mapped_column(
+        ForeignKey("automation_workflows.id", ondelete="CASCADE"), index=True
+    )
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    workflow_version: Mapped[int] = mapped_column()
+    input: Mapped[dict] = mapped_column(JSON)
+    steps_snapshot: Mapped[list[dict]] = mapped_column(JSON)
+    step_results: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    result_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    status: Mapped[AutomationWorkflowRunStatus] = mapped_column(
+        Enum(AutomationWorkflowRunStatus),
+        default=AutomationWorkflowRunStatus.QUEUED,
+        index=True,
+    )
+    failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_by: Mapped[str] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow

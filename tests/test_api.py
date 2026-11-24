@@ -1377,6 +1377,509 @@ def test_nexus_chat_rejects_system_messages_and_requires_user_last(client):
     assert assistant_last.status_code == 422
 
 
+def test_ai_conversation_persistence_is_tenant_and_actor_scoped(client):
+    headers = auth_headers(role="operator", tenant_id="tenant-a", subject="alice")
+    other_headers = auth_headers(role="operator", tenant_id="tenant-a", subject="bob")
+    other_tenant_headers = auth_headers(role="operator", tenant_id="tenant-b", subject="alice")
+
+    created = client.post(
+        "/api/v1/ai/conversations",
+        headers=headers,
+        json={"title": "Planning"},
+    )
+    assert created.status_code == 201
+    conversation_id = created.json()["id"]
+
+    client.post(
+        "/api/v1/models",
+        headers=headers,
+        json={
+            "name": "chat-primary",
+            "provider": "openai-compatible",
+            "model_identifier": "chat-model-v1",
+            "capabilities": ["chat"],
+        },
+    )
+    provider = StubInferenceProvider()
+    app.dependency_overrides[get_inference_provider] = lambda: provider
+
+    first = client.post(
+        "/api/v1/ai/infer",
+        headers=headers,
+        json={
+            "conversation_id": conversation_id,
+            "messages": [{"role": "user", "content": "Remember the color blue"}],
+        },
+    )
+    assert first.status_code == 200
+    assert first.json()["conversation_id"] == conversation_id
+
+    second = client.post(
+        "/api/v1/ai/infer",
+        headers=headers,
+        json={
+            "conversation_id": conversation_id,
+            "messages": [{"role": "user", "content": "What color?"}],
+        },
+    )
+    assert second.status_code == 200
+    assert [message.content for message in provider.request["messages"]] == [
+        "Remember the color blue",
+        "Hello from the model",
+        "What color?",
+    ]
+
+    messages = client.get(
+        f"/api/v1/ai/conversations/{conversation_id}/messages",
+        headers=headers,
+    )
+    assert messages.status_code == 200
+    assert [message["role"] for message in messages.json()] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+
+    assert client.get(
+        f"/api/v1/ai/conversations/{conversation_id}/messages",
+        headers=other_headers,
+    ).status_code == 404
+    assert client.get(
+        f"/api/v1/ai/conversations/{conversation_id}/messages",
+        headers=other_tenant_headers,
+    ).status_code == 404
+
+
+def test_agent_registry_lifecycle_and_run(client):
+    headers = auth_headers(role="operator", tenant_id="tenant-a")
+    other_tenant_headers = auth_headers(role="operator", tenant_id="tenant-b")
+    viewer_headers = auth_headers(role="viewer", tenant_id="tenant-a")
+    assert client.post(
+        "/api/v1/agents",
+        headers=viewer_headers,
+        json={
+            "name": "forbidden-agent",
+            "agent_type": "research",
+            "instructions": "No access.",
+        },
+    ).status_code == 403
+    created = client.post(
+        "/api/v1/agents",
+        headers=headers,
+        json={
+            "name": "researcher",
+            "agent_type": "research",
+            "instructions": "Research using the provided context.",
+            "capabilities": ["research"],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        },
+    )
+    assert created.status_code == 201
+    agent_id = created.json()["id"]
+    assert created.json()["status"] == "REGISTERED"
+    assert client.get("/api/v1/agents", headers=viewer_headers).status_code == 200
+    assert client.get(
+        f"/api/v1/agents/{agent_id}",
+        headers=other_tenant_headers,
+    ).status_code == 404
+
+    client.post(
+        "/api/v1/models",
+        headers=headers,
+        json={
+            "name": "chat-primary",
+            "provider": "openai-compatible",
+            "model_identifier": "chat-model-v1",
+            "capabilities": ["chat"],
+        },
+    )
+    provider = StubInferenceProvider()
+    app.dependency_overrides[get_inference_provider] = lambda: provider
+
+    disabled = client.post(
+        f"/api/v1/agents/{agent_id}/run",
+        headers=headers,
+        json={"prompt": "Do some research"},
+    )
+    assert disabled.status_code == 409
+    assert not hasattr(provider, "request")
+
+    enabled = client.patch(
+        f"/api/v1/agents/{agent_id}",
+        headers=headers,
+        json={"status": "ENABLED"},
+    )
+    assert enabled.status_code == 200
+    run = client.post(
+        f"/api/v1/agents/{agent_id}/run",
+        headers=headers,
+        json={"prompt": "private research request"},
+    )
+    assert run.status_code == 200
+    assert run.json()["agent_id"] == agent_id
+    assert provider.request["messages"][0].content == (
+        "Research using the provided context."
+    )
+    assert provider.request["tools"][0].function.name == "lookup"
+
+    audit_response = client.get("/api/v1/audit", headers=headers)
+    agent_run_event = next(
+        event
+        for event in audit_response.json()
+        if event["action"] == "AGENT_RUN_COMPLETED"
+    )
+    assert "private research request" not in str(agent_run_event["detail"])
+
+
+def test_agent_orchestration_runs_only_requested_enabled_agents(client):
+    headers = auth_headers(role="operator", tenant_id="tenant-a")
+    agent_ids = []
+    for name in ("researcher", "analyst"):
+        created = client.post(
+            "/api/v1/agents",
+            headers=headers,
+            json={
+                "name": name,
+                "agent_type": name,
+                "instructions": f"You are the {name}.",
+                "status": "ENABLED",
+            },
+        )
+        assert created.status_code == 201
+        agent_ids.append(created.json()["id"])
+    client.post(
+        "/api/v1/models",
+        headers=headers,
+        json={
+            "name": "chat-primary",
+            "provider": "openai-compatible",
+            "model_identifier": "chat-model-v1",
+            "capabilities": ["chat"],
+        },
+    )
+    provider = StubInferenceProvider()
+    app.dependency_overrides[get_inference_provider] = lambda: provider
+
+    result = client.post(
+        "/api/v1/agents/orchestrate",
+        headers=headers,
+        json={"agent_ids": agent_ids, "prompt": "Review this proposal"},
+    )
+    assert result.status_code == 200
+    assert [step["agent_id"] for step in result.json()["steps"]] == agent_ids
+    assert len(result.json()["steps"]) == 2
+    assert provider.request["messages"][0].content == "You are the analyst."
+
+
+def test_knowledge_documents_are_versioned_and_searchable_within_tenant(client):
+    headers = auth_headers(role="operator", tenant_id="tenant-a")
+    viewer_headers = auth_headers(role="viewer", tenant_id="tenant-a")
+    other_tenant_headers = auth_headers(role="viewer", tenant_id="tenant-b")
+    source_content = "Northstar project details. " * 80
+    created = client.post(
+        "/api/v1/knowledge/documents",
+        headers=headers,
+        json={
+            "name": "northstar",
+            "source": "manual://northstar",
+            "content": source_content,
+            "status": "ACTIVE",
+        },
+    )
+    assert created.status_code == 201
+    document_id = created.json()["id"]
+    assert created.json()["current_version"] == 1
+
+    content = client.get(
+        f"/api/v1/knowledge/documents/{document_id}/content",
+        headers=viewer_headers,
+    )
+    assert content.status_code == 200
+    assert content.json()["content"] == source_content
+
+    search = client.post(
+        "/api/v1/knowledge/search",
+        headers=viewer_headers,
+        json={"query": "northstar project", "limit": 5},
+    )
+    assert search.status_code == 200
+    assert search.json()["hits"]
+    assert search.json()["hits"][0]["document_id"] == document_id
+    assert search.json()["hits"][0]["score"] == 1.0
+    assert client.post(
+        "/api/v1/knowledge/search",
+        headers=other_tenant_headers,
+        json={"query": "northstar"},
+    ).json()["hits"] == []
+
+    updated = client.patch(
+        f"/api/v1/knowledge/documents/{document_id}",
+        headers=headers,
+        json={"content": "Revised starship launch facts.", "status": "ACTIVE"},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["current_version"] == 2
+    revised_search = client.post(
+        "/api/v1/knowledge/search",
+        headers=headers,
+        json={"query": "revised launch"},
+    )
+    assert revised_search.json()["hits"][0]["version"] == 2
+    assert "Revised starship" in revised_search.json()["hits"][0]["text"]
+    versions = client.get(
+        f"/api/v1/knowledge/documents/{document_id}/versions",
+        headers=viewer_headers,
+    )
+    assert versions.status_code == 200
+    assert [version["version"] for version in versions.json()] == [1, 2]
+    original_content = client.get(
+        f"/api/v1/knowledge/documents/{document_id}/content?version=1",
+        headers=viewer_headers,
+    )
+    assert original_content.json()["content"] == source_content
+    assert client.post(
+        "/api/v1/knowledge/search",
+        headers=headers,
+        json={"query": "northstar"},
+    ).json()["hits"] == []
+
+    audit_response = client.get("/api/v1/audit", headers=headers)
+    knowledge_events = [
+        event
+        for event in audit_response.json()
+        if event["action"].startswith("KNOWLEDGE_")
+    ]
+    assert knowledge_events
+    assert source_content not in str(knowledge_events)
+
+    deleted = client.delete(
+        f"/api/v1/knowledge/documents/{document_id}",
+        headers=headers,
+    )
+    assert deleted.status_code == 204
+    assert client.get(
+        f"/api/v1/knowledge/documents/{document_id}",
+        headers=headers,
+    ).status_code == 404
+
+
+def test_knowledge_source_registry_is_tenant_scoped_and_audited(client):
+    owner_headers = auth_headers(role="owner", tenant_id="tenant-a")
+    viewer_headers = auth_headers(role="viewer", tenant_id="tenant-a")
+    other_tenant_headers = auth_headers(role="viewer", tenant_id="tenant-b")
+
+    created = client.post(
+        "/api/v1/knowledge/sources",
+        headers=owner_headers,
+        json={
+            "name": "OpenAlex",
+            "url": "https://openalex.org",
+            "source_type": "ACADEMIC_INDEX",
+            "knowledge_domains": ["Computer Science", "Research"],
+            "credibility": "S2",
+            "status": "VERIFIED",
+            "access_method": "API",
+            "license": "CC0",
+            "update_frequency": "DAILY",
+            "security_risk": "LOW",
+            "research_status": "APPROVED",
+        },
+    )
+    assert created.status_code == 201
+    source = created.json()
+    source_id = source["id"]
+    assert source["tenant_id"] == "tenant-a"
+    assert source["credibility"] == "S2"
+    assert source["last_verified_at"] is not None
+
+    assert client.get(
+        f"/api/v1/knowledge/sources/{source_id}",
+        headers=viewer_headers,
+    ).status_code == 200
+    assert client.get(
+        f"/api/v1/knowledge/sources/{source_id}",
+        headers=other_tenant_headers,
+    ).status_code == 404
+    assert client.patch(
+        f"/api/v1/knowledge/sources/{source_id}",
+        headers=viewer_headers,
+        json={"research_status": "IN_REVIEW"},
+    ).status_code == 403
+
+    updated = client.patch(
+        f"/api/v1/knowledge/sources/{source_id}",
+        headers=owner_headers,
+        json={"status": "RESTRICTED", "security_risk": "HIGH"},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["status"] == "RESTRICTED"
+    assert updated.json()["security_risk"] == "HIGH"
+
+    listed = client.get(
+        "/api/v1/knowledge/sources?status=RESTRICTED&credibility=S2",
+        headers=viewer_headers,
+    )
+    assert listed.status_code == 200
+    assert [item["id"] for item in listed.json()] == [source_id]
+
+    audit_response = client.get("/api/v1/audit", headers=owner_headers)
+    source_events = [
+        event
+        for event in audit_response.json()
+        if event["action"].startswith("KNOWLEDGE_SOURCE_")
+    ]
+    assert {event["action"] for event in source_events} >= {
+        "KNOWLEDGE_SOURCE_CREATED",
+        "KNOWLEDGE_SOURCE_UPDATED",
+    }
+
+    assert client.delete(
+        f"/api/v1/knowledge/sources/{source_id}",
+        headers=owner_headers,
+    ).status_code == 204
+    assert client.get(
+        f"/api/v1/knowledge/sources/{source_id}",
+        headers=viewer_headers,
+    ).status_code == 404
+
+
+def test_knowledge_source_registry_rejects_duplicate_names_and_domains(client):
+    headers = auth_headers(role="owner", tenant_id="tenant-a")
+    payload = {
+        "name": "Duplicate",
+        "source_type": "DATABASE",
+        "knowledge_domains": ["Science"],
+        "access_method": "WEB",
+    }
+    assert client.post(
+        "/api/v1/knowledge/sources",
+        headers=headers,
+        json=payload,
+    ).status_code == 201
+    assert client.post(
+        "/api/v1/knowledge/sources",
+        headers=headers,
+        json=payload,
+    ).status_code == 409
+    assert client.post(
+        "/api/v1/knowledge/sources",
+        headers=headers,
+        json={
+            **payload,
+            "name": "InvalidDomains",
+            "knowledge_domains": ["Science", "Science"],
+        },
+    ).status_code == 422
+
+
+def test_knowledge_drafts_are_hidden_and_registry_requires_manage_permission(client):
+    operator_headers = auth_headers(role="operator", tenant_id="tenant-a")
+    viewer_headers = auth_headers(role="viewer", tenant_id="tenant-a")
+    draft = client.post(
+        "/api/v1/knowledge/documents",
+        headers=operator_headers,
+        json={
+            "name": "draft",
+            "source": "manual://draft",
+            "content": "unpublished star map",
+        },
+    )
+    assert draft.status_code == 201
+    assert draft.json()["status"] == "DRAFT"
+    assert client.post(
+        "/api/v1/knowledge/search",
+        headers=viewer_headers,
+        json={"query": "star map"},
+    ).json()["hits"] == []
+    assert client.post(
+        "/api/v1/knowledge/documents",
+        headers=viewer_headers,
+        json={
+            "name": "forbidden",
+            "source": "manual://forbidden",
+            "content": "viewer cannot write",
+        },
+    ).status_code == 403
+
+
+def test_intelligence_assessment_persists_results_with_tenant_access(client):
+    headers = auth_headers(role="operator", tenant_id="tenant-a")
+    viewer_headers = auth_headers(role="viewer", tenant_id="tenant-a")
+    other_tenant_headers = auth_headers(role="viewer", tenant_id="tenant-b")
+    payload = {
+        "title": "Platform choice",
+        "objective": "Choose a platform for private project context",
+        "criteria": [
+            {"name": "security", "weight": 0.7},
+            {"name": "cost", "weight": 0.3},
+        ],
+        "alternatives": [
+            {
+                "name": "Managed",
+                "scores": {"security": 90, "cost": 60},
+                "risks": [
+                    {"name": "Vendor lock-in", "probability": 3, "impact": 4}
+                ],
+            },
+            {
+                "name": "Self-hosted",
+                "scores": {"security": 80, "cost": 75},
+                "risks": [],
+            },
+        ],
+    }
+
+    created = client.post(
+        "/api/v1/intelligence/assessments",
+        headers=headers,
+        json=payload,
+    )
+    assert created.status_code == 201
+    assessment_id = created.json()["id"]
+    assert created.json()["alternatives"][0]["name"] == "Managed"
+    assert created.json()["alternatives"][0]["weighted_score"] == 81.0
+    assert created.json()["alternatives"][0]["risk_score"] == 12
+
+    detail = client.get(
+        f"/api/v1/intelligence/assessments/{assessment_id}",
+        headers=viewer_headers,
+    )
+    assert detail.status_code == 200
+    assert detail.json()["objective"] == payload["objective"]
+    assert client.get(
+        f"/api/v1/intelligence/assessments/{assessment_id}",
+        headers=other_tenant_headers,
+    ).status_code == 404
+    assert client.get(
+        "/api/v1/intelligence/assessments",
+        headers=viewer_headers,
+    ).json()[0]["criterion_count"] == 2
+
+    viewer_create = client.post(
+        "/api/v1/intelligence/assessments",
+        headers=viewer_headers,
+        json=payload,
+    )
+    assert viewer_create.status_code == 403
+
+    audit_response = client.get("/api/v1/audit", headers=headers)
+    assessment_event = next(
+        event
+        for event in audit_response.json()
+        if event["action"] == "INTELLIGENCE_ASSESSMENT_CREATED"
+    )
+    assert payload["objective"] not in str(assessment_event["detail"])
+
+
 def test_ai_inference_obeys_emergency_stop(client):
     headers = auth_headers(role="owner", tenant_id="tenant-a")
     client.post(

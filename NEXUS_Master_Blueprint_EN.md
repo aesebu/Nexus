@@ -235,6 +235,8 @@ Memory and knowledge system.
 - Episodic Memory
 - Semantic Memory
 - Knowledge Repository
+- Knowledge Source Registry
+- Source Credibility and Verification Metadata
 - Semantic Retrieval
 - Knowledge Graph
 
@@ -293,14 +295,20 @@ Security and governance system.
 | Core Module | Implemented in MVP | Outstanding |
 |---|---|---|
 | CORE-01: Control Engine | Command lifecycle, system registry, manual task lifecycle, durable AI inference worker queue, event journal, tenant configuration store | Additional task handlers, event broker/dispatch, runtime health monitoring, live configuration application |
-| CORE-02: AI Engine | OpenAI-compatible inference and NEXUS assistant chat with a fixed identity prompt and request-scoped messages | Persistent context, structured output, tool calling, response evaluation |
+| CORE-02: AI Engine | OpenAI-compatible inference, persistent tenant/actor-scoped conversations, structured output, and tool-call declarations | Response evaluation, additional provider adapters |
 | CORE-03: Model Intelligence | Tenant-scoped model registry and deterministic capability routing | Model discovery, evaluation, monitoring, additional provider adapters |
+| CORE-04: Agent Engine | Tenant-scoped agent registry, lifecycle, explicit invocation, and ordered multi-agent orchestration | Autonomous scheduling, tool execution, agent messaging, and delegated permissions |
+| CORE-05: Memory & Knowledge Engine | Tenant-scoped versioned document repository, deterministic lexical chunk retrieval, and a tenant-scoped source registry with credibility, license, access, verification, and lifecycle metadata | Embeddings, semantic/vector retrieval, automatic RAG, knowledge graph, evidence provenance, personal memory |
+| CORE-06: Intelligence Engine | Persisted deterministic weighted decision assessments and separate 5x5 risk analysis | AI recommendations, predictive modeling, dataset pattern analysis, automated decisions |
+| CORE-07: Automation Engine | Tenant-scoped versioned workflows with ordered AI inference steps, input conditions, delayed runs, and resumable worker execution | Recurring/event triggers, arbitrary code, graph branching, parallel execution, automatic agent/tool orchestration |
 | CORE-09: Security & Governance | Tenant RBAC, fail-closed command policies, immutable policy version history, payload-key approval rules, approval separation, audit, emergency stop, encrypted tenant secret store | Risk scoring, key rotation, external KMS |
 
 Registry status is administrative metadata and does not prove runtime health.
-The task worker executes queued AI inference work with database-backed leases;
-manual tasks still use lifecycle endpoints. The event journal stores and
-filters events but does not dispatch them. Tenant configuration is stored for
+The task worker executes queued AI inference and workflow work with
+database-backed leases; manual tasks still use lifecycle endpoints. Workflow
+runs snapshot their definitions and persist completed steps, while provider
+timeouts remain at-least-once. The event journal stores and filters events but
+does not dispatch them. Tenant configuration is stored for
 management only and is not a secret store or a live runtime configuration
 source. Secret values are encrypted with an externally supplied application
 key and are not returned by the HTTP API; key rotation and external KMS
@@ -489,11 +497,11 @@ The system must provide:
 | 02 | Authority & Governance | Governance Engine | Complete (validated) |
 | 03 | Core Foundation | Central Control | Complete (MVP) |
 | 04 | AI Infrastructure | Model Intelligence | Complete (validated) |
-| 05 | AI Engine | Inference Engine | Partial |
-| 06 | Agent Intelligence | Agent Engine | Planned |
-| 07 | Memory & Knowledge | Knowledge Platform | Planned |
-| 08 | Intelligence Engine | Reasoning & Decision Support | Planned |
-| 09 | Automation | Workflow Engine | Planned |
+| 05 | AI Engine | Inference Engine | Complete (MVP) |
+| 06 | Agent Intelligence | Agent Engine | Complete (MVP) |
+| 07 | Memory & Knowledge | Knowledge Repository and Source Registry | Complete (MVP) |
+| 08 | Intelligence Engine | Reasoning & Decision Support | Complete (MVP) |
+| 09 | Automation | Workflow Engine | Complete (MVP) |
 | 10 | NEXUS System | Operational Ecosystem | Planned |
 | 11 | Integration | Integrated Platform | Planned |
 | 12 | Production | Production Release | Planned |

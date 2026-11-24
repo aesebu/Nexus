@@ -1,8 +1,10 @@
-from datetime import datetime, timezone
+import json
+import re
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import delete, select
+from sqlalchemy import case, delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -16,12 +18,28 @@ from app.ai.providers import (
     UnsupportedProviderError,
 )
 from app.ai.assistant import build_nexus_messages
+from app.intelligence.decision import analyze_decision
 from app.core.config import settings
 from app.core.database import get_db
 from app.models import (
     AIModel,
     AIModelHealthStatus,
     AIModelStatus,
+    AIConversation,
+    AIConversationMessage,
+    AIAgent,
+    AgentStatus,
+    KnowledgeChunk,
+    KnowledgeDocument,
+    KnowledgeDocumentStatus,
+    KnowledgeDocumentVersion,
+    KnowledgeSource,
+    KnowledgeSourceStatus,
+    IntelligenceAssessment,
+    AutomationWorkflow,
+    AutomationWorkflowRun,
+    AutomationWorkflowRunStatus,
+    AutomationWorkflowStatus,
     AuditEvent,
     Command,
     CommandPolicy,
@@ -41,10 +59,42 @@ from app.models import (
 )
 from app.schemas import (
     AIModelCreate,
+    AIMessage,
     AIModelDiscoveryResponse,
     AIModelHealthResponse,
     AIModelResponse,
     AIModelUpdate,
+    AIConversationCreate,
+    AIConversationMessageResponse,
+    AIConversationResponse,
+    AIAgentCreate,
+    AIAgentUpdate,
+    AIAgentResponse,
+    AIAgentRunRequest,
+    AIAgentRunResponse,
+    AIAgentOrchestrationRequest,
+    AIAgentOrchestrationResponse,
+    AIAgentOrchestrationStep,
+    AITool,
+    KnowledgeDocumentContentResponse,
+    KnowledgeDocumentCreate,
+    KnowledgeDocumentResponse,
+    KnowledgeDocumentUpdate,
+    KnowledgeDocumentVersionResponse,
+    KnowledgeSearchHit,
+    KnowledgeSearchRequest,
+    KnowledgeSearchResponse,
+    KnowledgeSourceCreate,
+    KnowledgeSourceResponse,
+    KnowledgeSourceUpdate,
+    DecisionAssessmentCreate,
+    DecisionAssessmentListItem,
+    DecisionAssessmentResponse,
+    AutomationWorkflowCreate,
+    AutomationWorkflowResponse,
+    AutomationWorkflowUpdate,
+    AutomationWorkflowRunCreate,
+    AutomationWorkflowRunResponse,
     AuditResponse,
     CommandCreate,
     CommandPolicyCreate,
@@ -837,6 +887,14 @@ def cancel_task(
         work_item.status = WorkItemStatus.CANCELLED
         work_item.claimed_by = None
         work_item.lease_expires_at = None
+    workflow_run = db.scalar(
+        select(AutomationWorkflowRun)
+        .where(AutomationWorkflowRun.task_id == task.id)
+        .with_for_update()
+    )
+    if workflow_run is not None:
+        workflow_run.status = AutomationWorkflowRunStatus.CANCELLED
+        workflow_run.failure_reason = None
     audit(
         db,
         tenant_id=tenant_id,
@@ -1712,9 +1770,41 @@ def _run_inference(
     provider: InferenceProvider,
 ) -> InferenceResponse:
     actor, tenant_id = identity
+    new_conversation_messages = list(request.messages)
     stop = emergency_stop(db, tenant_id)
     if stop.active:
         raise HTTPException(status_code=409, detail="Emergency stop is active")
+
+    if request.conversation_id is not None:
+        conversation = db.scalar(
+            select(AIConversation).where(
+                AIConversation.id == request.conversation_id,
+                AIConversation.tenant_id == tenant_id,
+                AIConversation.created_by == actor,
+            )
+        )
+        if conversation is None:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        new_messages = list(request.messages)
+        stored = list(
+            db.scalars(
+                select(AIConversationMessage)
+                .where(AIConversationMessage.conversation_id == conversation.id)
+                .order_by(AIConversationMessage.sequence.asc())
+                .limit(100)
+            )
+        )
+        stored_messages = [
+            AIMessage(role=message.role, content=message.content)
+            for message in stored
+            if message.role in {"system", "user", "assistant"}
+        ]
+        request.messages = (
+            [message for message in new_messages if message.role == "system"]
+            + stored_messages
+            + [message for message in new_messages if message.role != "system"]
+        )
+        request.conversation_id = conversation.id
 
     statement = (
         select(AIModel)
@@ -1745,6 +1835,8 @@ def _run_inference(
             messages=request.messages,
             temperature=request.temperature,
             max_tokens=request.max_tokens,
+            response_format=request.response_format,
+            tools=request.tools,
         )
     except ProviderNotConfiguredError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -1770,6 +1862,47 @@ def _run_inference(
             "output_tokens": result.output_tokens,
         },
     )
+    conversation_id = request.conversation_id
+    if conversation_id is not None:
+        conversation = db.scalar(
+            select(AIConversation).where(
+                AIConversation.id == conversation_id,
+                AIConversation.tenant_id == tenant_id,
+                AIConversation.created_by == actor,
+            )
+        )
+        if conversation is not None:
+            sequences = list(
+                db.scalars(
+                    select(AIConversationMessage.sequence)
+                    .where(AIConversationMessage.conversation_id == conversation.id)
+                    .order_by(AIConversationMessage.sequence.desc())
+                    .limit(1)
+                )
+            )
+            next_sequence = (sequences[0] + 1) if sequences else 1
+            request_messages = new_conversation_messages
+            db.add_all(
+                AIConversationMessage(
+                    conversation_id=conversation.id,
+                    tenant_id=tenant_id,
+                    sequence=next_sequence + offset,
+                    role=message.role,
+                    content=message.content,
+                )
+                for offset, message in enumerate(request_messages)
+                if message.role in {"user", "assistant"}
+            )
+            db.add(
+                AIConversationMessage(
+                    conversation_id=conversation.id,
+                    tenant_id=tenant_id,
+                    sequence=next_sequence + len(request_messages),
+                    role="assistant",
+                    content=result.content,
+                )
+            )
+            conversation.updated_at = utcnow()
     db.commit()
     return InferenceResponse(
         model_id=model.id,
@@ -1779,6 +1912,9 @@ def _run_inference(
         content=result.content,
         input_tokens=result.input_tokens,
         output_tokens=result.output_tokens,
+        conversation_id=conversation_id,
+        tool_calls=result.tool_calls or [],
+        structured_output=result.structured_output,
     )
 
 
@@ -1796,6 +1932,1342 @@ def nexus_chat(
         max_tokens=request.max_tokens,
     )
     return _run_inference(inference_request, db, identity, provider)
+
+
+@router.post(
+    "/ai/conversations",
+    response_model=AIConversationResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_ai_conversation(
+    request: AIConversationCreate,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.ai.infer")),
+) -> AIConversation:
+    actor, tenant_id = identity
+    conversation = AIConversation(
+        tenant_id=tenant_id,
+        created_by=actor,
+        title=request.title,
+    )
+    db.add(conversation)
+    db.flush()
+    conversation_id = conversation.id
+    audit(
+        db,
+        tenant_id=tenant_id,
+        actor=actor,
+        action="AI_CONVERSATION_CREATED",
+        resource_type="AIConversation",
+        resource_id=conversation_id,
+        outcome="SUCCESS",
+        detail={"title": request.title},
+    )
+    db.commit()
+    db.refresh(conversation)
+    return conversation
+
+
+@router.get(
+    "/ai/conversations/{conversation_id}/messages",
+    response_model=list[AIConversationMessageResponse],
+)
+def list_ai_conversation_messages(
+    conversation_id: str,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.ai.infer")),
+) -> list[AIConversationMessage]:
+    actor, tenant_id = identity
+    conversation = db.scalar(
+        select(AIConversation).where(
+            AIConversation.id == conversation_id,
+            AIConversation.tenant_id == tenant_id,
+            AIConversation.created_by == actor,
+        )
+    )
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return list(
+        db.scalars(
+            select(AIConversationMessage)
+            .where(AIConversationMessage.conversation_id == conversation.id)
+            .order_by(AIConversationMessage.sequence.asc())
+        )
+    )
+
+
+@router.delete(
+    "/ai/conversations/{conversation_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_ai_conversation(
+    conversation_id: str,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.ai.infer")),
+) -> None:
+    actor, tenant_id = identity
+    conversation = db.scalar(
+        select(AIConversation).where(
+            AIConversation.id == conversation_id,
+            AIConversation.tenant_id == tenant_id,
+            AIConversation.created_by == actor,
+        )
+    )
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    db.execute(
+        delete(AIConversationMessage).where(
+            AIConversationMessage.conversation_id == conversation.id
+        )
+    )
+    db.delete(conversation)
+    audit(
+        db,
+        tenant_id=tenant_id,
+        actor=actor,
+        action="AI_CONVERSATION_DELETED",
+        resource_type="AIConversation",
+        resource_id=conversation.id,
+        outcome="SUCCESS",
+        detail={},
+    )
+    db.commit()
+
+
+KNOWLEDGE_CHUNK_SIZE = 1200
+KNOWLEDGE_CHUNK_OVERLAP = 200
+
+
+def _knowledge_chunks(content: str) -> list[tuple[int, int, str]]:
+    chunks = []
+    start = 0
+    while start < len(content):
+        end = min(start + KNOWLEDGE_CHUNK_SIZE, len(content))
+        chunks.append((start, end, content[start:end]))
+        if end == len(content):
+            break
+        start = end - KNOWLEDGE_CHUNK_OVERLAP
+    return chunks
+
+
+def _store_knowledge_version(
+    db: Session,
+    *,
+    document: KnowledgeDocument,
+    content: str,
+    actor: str,
+) -> None:
+    version = KnowledgeDocumentVersion(
+        document_id=document.id,
+        tenant_id=document.tenant_id,
+        version=document.current_version,
+        content=content,
+        created_by=actor,
+    )
+    db.add(version)
+    db.flush()
+    db.add_all(
+        KnowledgeChunk(
+            document_id=document.id,
+            document_version_id=version.id,
+            tenant_id=document.tenant_id,
+            chunk_index=index,
+            start_offset=start,
+            end_offset=end,
+            content=chunk,
+        )
+        for index, (start, end, chunk) in enumerate(_knowledge_chunks(content))
+    )
+
+
+def _knowledge_document_for_tenant(
+    db: Session,
+    *,
+    document_id: str,
+    tenant_id: str,
+) -> KnowledgeDocument:
+    document = db.scalar(
+        select(KnowledgeDocument).where(
+            KnowledgeDocument.id == document_id,
+            KnowledgeDocument.tenant_id == tenant_id,
+        )
+    )
+    if document is None:
+        raise HTTPException(status_code=404, detail="Knowledge document not found")
+    return document
+
+
+def _knowledge_source_for_tenant(
+    db: Session,
+    *,
+    source_id: str,
+    tenant_id: str,
+) -> KnowledgeSource:
+    source = db.scalar(
+        select(KnowledgeSource).where(
+            KnowledgeSource.id == source_id,
+            KnowledgeSource.tenant_id == tenant_id,
+        )
+    )
+    if source is None:
+        raise HTTPException(status_code=404, detail="Knowledge source not found")
+    return source
+
+
+@router.post(
+    "/knowledge/sources",
+    response_model=KnowledgeSourceResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_knowledge_source(
+    request: KnowledgeSourceCreate,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.knowledge.manage")),
+) -> KnowledgeSource:
+    actor, tenant_id = identity
+    existing = db.scalar(
+        select(KnowledgeSource).where(
+            KnowledgeSource.tenant_id == tenant_id,
+            KnowledgeSource.name == request.name,
+        )
+    )
+    if existing is not None:
+        raise HTTPException(status_code=409, detail="Knowledge source name already exists")
+    source = KnowledgeSource(
+        tenant_id=tenant_id,
+        created_by=actor,
+        last_verified_at=utcnow() if request.status == KnowledgeSourceStatus.VERIFIED else None,
+        **request.model_dump(exclude={"status"}),
+        status=request.status,
+    )
+    try:
+        db.add(source)
+        db.flush()
+        audit(
+            db,
+            tenant_id=tenant_id,
+            actor=actor,
+            action="KNOWLEDGE_SOURCE_CREATED",
+            resource_type="KnowledgeSource",
+            resource_id=source.id,
+            outcome="SUCCESS",
+            detail={
+                "name": source.name,
+                "source_type": source.source_type,
+                "credibility": source.credibility.value,
+                "status": source.status.value,
+            },
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Knowledge source name already exists",
+        ) from exc
+    db.refresh(source)
+    return source
+
+
+@router.get(
+    "/knowledge/sources",
+    response_model=list[KnowledgeSourceResponse],
+)
+def list_knowledge_sources(
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.knowledge.read")),
+    source_status: KnowledgeSourceStatus | None = Query(default=None, alias="status"),
+    credibility: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> list[KnowledgeSource]:
+    _actor, tenant_id = identity
+    statement = select(KnowledgeSource).where(KnowledgeSource.tenant_id == tenant_id)
+    if source_status is not None:
+        statement = statement.where(KnowledgeSource.status == source_status)
+    if credibility is not None:
+        from app.models import KnowledgeSourceCredibility
+
+        try:
+            credibility_level = KnowledgeSourceCredibility(credibility.upper())
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="Invalid credibility level") from exc
+        statement = statement.where(KnowledgeSource.credibility == credibility_level)
+    return list(
+        db.scalars(
+            statement.order_by(KnowledgeSource.name.asc())
+            .offset(offset)
+            .limit(limit)
+        )
+    )
+
+
+@router.get(
+    "/knowledge/sources/{source_id}",
+    response_model=KnowledgeSourceResponse,
+)
+def get_knowledge_source(
+    source_id: str,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.knowledge.read")),
+) -> KnowledgeSource:
+    _actor, tenant_id = identity
+    return _knowledge_source_for_tenant(db, source_id=source_id, tenant_id=tenant_id)
+
+
+@router.patch(
+    "/knowledge/sources/{source_id}",
+    response_model=KnowledgeSourceResponse,
+)
+def update_knowledge_source(
+    source_id: str,
+    request: KnowledgeSourceUpdate,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.knowledge.manage")),
+) -> KnowledgeSource:
+    actor, tenant_id = identity
+    source = db.scalar(
+        select(KnowledgeSource)
+        .where(
+            KnowledgeSource.id == source_id,
+            KnowledgeSource.tenant_id == tenant_id,
+        )
+        .with_for_update()
+    )
+    if source is None:
+        raise HTTPException(status_code=404, detail="Knowledge source not found")
+
+    updates = request.model_dump(exclude_unset=True)
+    for field, value in updates.items():
+        setattr(source, field, value)
+    if "status" in updates and source.status == KnowledgeSourceStatus.VERIFIED:
+        source.last_verified_at = utcnow()
+    source.updated_at = utcnow()
+    audit(
+        db,
+        tenant_id=tenant_id,
+        actor=actor,
+        action="KNOWLEDGE_SOURCE_UPDATED",
+        resource_type="KnowledgeSource",
+        resource_id=source.id,
+        outcome="SUCCESS",
+        detail={"fields": sorted(updates)},
+    )
+    db.commit()
+    db.refresh(source)
+    return source
+
+
+@router.delete(
+    "/knowledge/sources/{source_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_knowledge_source(
+    source_id: str,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.knowledge.manage")),
+) -> None:
+    actor, tenant_id = identity
+    source = _knowledge_source_for_tenant(db, source_id=source_id, tenant_id=tenant_id)
+    db.delete(source)
+    audit(
+        db,
+        tenant_id=tenant_id,
+        actor=actor,
+        action="KNOWLEDGE_SOURCE_DELETED",
+        resource_type="KnowledgeSource",
+        resource_id=source.id,
+        outcome="SUCCESS",
+        detail={"name": source.name},
+    )
+    db.commit()
+
+
+@router.post(
+    "/knowledge/documents",
+    response_model=KnowledgeDocumentResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_knowledge_document(
+    request: KnowledgeDocumentCreate,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.knowledge.manage")),
+) -> KnowledgeDocument:
+    actor, tenant_id = identity
+    existing = db.scalar(
+        select(KnowledgeDocument).where(
+            KnowledgeDocument.tenant_id == tenant_id,
+            KnowledgeDocument.name == request.name,
+        )
+    )
+    if existing is not None:
+        raise HTTPException(status_code=409, detail="Knowledge document name already exists")
+
+    document = KnowledgeDocument(
+        tenant_id=tenant_id,
+        name=request.name,
+        description=request.description,
+        source=request.source,
+        status=request.status,
+        current_version=1,
+        created_by=actor,
+    )
+    try:
+        db.add(document)
+        db.flush()
+        _store_knowledge_version(
+            db,
+            document=document,
+            content=request.content,
+            actor=actor,
+        )
+        audit(
+            db,
+            tenant_id=tenant_id,
+            actor=actor,
+            action="KNOWLEDGE_DOCUMENT_CREATED",
+            resource_type="KnowledgeDocument",
+            resource_id=document.id,
+            outcome="SUCCESS",
+            detail={
+                "name": document.name,
+                "status": document.status.value,
+                "version": document.current_version,
+                "chunk_count": len(_knowledge_chunks(request.content)),
+            },
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Knowledge document name already exists",
+        ) from exc
+    db.refresh(document)
+    return document
+
+
+@router.get(
+    "/knowledge/documents",
+    response_model=list[KnowledgeDocumentResponse],
+)
+def list_knowledge_documents(
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.knowledge.read")),
+    document_status: KnowledgeDocumentStatus | None = Query(
+        default=None,
+        alias="status",
+    ),
+    limit: int = Query(default=100, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> list[KnowledgeDocument]:
+    _actor, tenant_id = identity
+    statement = select(KnowledgeDocument).where(
+        KnowledgeDocument.tenant_id == tenant_id
+    )
+    if document_status is not None:
+        statement = statement.where(KnowledgeDocument.status == document_status)
+    return list(
+        db.scalars(
+            statement.order_by(KnowledgeDocument.name.asc())
+            .offset(offset)
+            .limit(limit)
+        )
+    )
+
+
+@router.get(
+    "/knowledge/documents/{document_id}",
+    response_model=KnowledgeDocumentResponse,
+)
+def get_knowledge_document(
+    document_id: str,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.knowledge.read")),
+) -> KnowledgeDocument:
+    _actor, tenant_id = identity
+    return _knowledge_document_for_tenant(
+        db,
+        document_id=document_id,
+        tenant_id=tenant_id,
+    )
+
+
+@router.get(
+    "/knowledge/documents/{document_id}/content",
+    response_model=KnowledgeDocumentContentResponse,
+)
+def get_knowledge_document_content(
+    document_id: str,
+    version_number: int | None = Query(default=None, ge=1, alias="version"),
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.knowledge.read")),
+) -> KnowledgeDocumentContentResponse:
+    _actor, tenant_id = identity
+    document = _knowledge_document_for_tenant(
+        db,
+        document_id=document_id,
+        tenant_id=tenant_id,
+    )
+    version = db.scalar(
+        select(KnowledgeDocumentVersion).where(
+            KnowledgeDocumentVersion.document_id == document.id,
+            KnowledgeDocumentVersion.tenant_id == tenant_id,
+            KnowledgeDocumentVersion.version
+            == (version_number or document.current_version),
+        )
+    )
+    if version is None:
+        raise HTTPException(status_code=500, detail="Current knowledge version is missing")
+    return KnowledgeDocumentContentResponse(
+        document=KnowledgeDocumentResponse.model_validate(document),
+        version=version.version,
+        content=version.content,
+    )
+
+
+@router.get(
+    "/knowledge/documents/{document_id}/versions",
+    response_model=list[KnowledgeDocumentVersionResponse],
+)
+def list_knowledge_document_versions(
+    document_id: str,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.knowledge.read")),
+) -> list[KnowledgeDocumentVersion]:
+    _actor, tenant_id = identity
+    document = _knowledge_document_for_tenant(
+        db,
+        document_id=document_id,
+        tenant_id=tenant_id,
+    )
+    return list(
+        db.scalars(
+            select(KnowledgeDocumentVersion)
+            .where(
+                KnowledgeDocumentVersion.document_id == document.id,
+                KnowledgeDocumentVersion.tenant_id == tenant_id,
+            )
+            .order_by(KnowledgeDocumentVersion.version.asc())
+        )
+    )
+
+
+@router.patch(
+    "/knowledge/documents/{document_id}",
+    response_model=KnowledgeDocumentResponse,
+)
+def update_knowledge_document(
+    document_id: str,
+    request: KnowledgeDocumentUpdate,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.knowledge.manage")),
+) -> KnowledgeDocument:
+    actor, tenant_id = identity
+    document = db.scalar(
+        select(KnowledgeDocument)
+        .where(
+            KnowledgeDocument.id == document_id,
+            KnowledgeDocument.tenant_id == tenant_id,
+        )
+        .with_for_update()
+    )
+    if document is None:
+        raise HTTPException(status_code=404, detail="Knowledge document not found")
+    updates = request.model_dump(exclude_unset=True)
+    content = updates.pop("content", None)
+    for field, value in updates.items():
+        setattr(document, field, value)
+    if content is not None:
+        document.current_version += 1
+        _store_knowledge_version(
+            db,
+            document=document,
+            content=content,
+            actor=actor,
+        )
+    document.updated_at = utcnow()
+    audit(
+        db,
+        tenant_id=tenant_id,
+        actor=actor,
+        action="KNOWLEDGE_DOCUMENT_UPDATED",
+        resource_type="KnowledgeDocument",
+        resource_id=document.id,
+        outcome="SUCCESS",
+        detail={
+            "fields": sorted(request.model_dump(exclude_unset=True)),
+            "version": document.current_version,
+        },
+    )
+    db.commit()
+    db.refresh(document)
+    return document
+
+
+@router.delete(
+    "/knowledge/documents/{document_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_knowledge_document(
+    document_id: str,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.knowledge.manage")),
+) -> None:
+    actor, tenant_id = identity
+    document = _knowledge_document_for_tenant(
+        db,
+        document_id=document_id,
+        tenant_id=tenant_id,
+    )
+    db.execute(
+        delete(KnowledgeChunk).where(KnowledgeChunk.document_id == document.id)
+    )
+    db.execute(
+        delete(KnowledgeDocumentVersion).where(
+            KnowledgeDocumentVersion.document_id == document.id
+        )
+    )
+    db.delete(document)
+    audit(
+        db,
+        tenant_id=tenant_id,
+        actor=actor,
+        action="KNOWLEDGE_DOCUMENT_DELETED",
+        resource_type="KnowledgeDocument",
+        resource_id=document.id,
+        outcome="SUCCESS",
+        detail={"name": document.name},
+    )
+    db.commit()
+
+
+@router.post(
+    "/knowledge/search",
+    response_model=KnowledgeSearchResponse,
+)
+def search_knowledge(
+    request: KnowledgeSearchRequest,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.knowledge.read")),
+) -> KnowledgeSearchResponse:
+    actor, tenant_id = identity
+    terms = list(dict.fromkeys(re.findall(r"\w+", request.query.lower())))
+    term_matches = [
+        func.lower(KnowledgeChunk.content).contains(term, autoescape=True)
+        for term in terms
+    ]
+    matched_term_count = sum(case((match, 1), else_=0) for match in term_matches)
+    statement = (
+        select(
+            KnowledgeChunk,
+            KnowledgeDocumentVersion,
+            KnowledgeDocument,
+            matched_term_count.label("matched_term_count"),
+        )
+        .join(
+            KnowledgeDocumentVersion,
+            KnowledgeDocumentVersion.id == KnowledgeChunk.document_version_id,
+        )
+        .join(
+            KnowledgeDocument,
+            KnowledgeDocument.id == KnowledgeChunk.document_id,
+        )
+        .where(
+            KnowledgeChunk.tenant_id == tenant_id,
+            KnowledgeDocumentVersion.tenant_id == tenant_id,
+            KnowledgeDocument.tenant_id == tenant_id,
+            KnowledgeDocumentVersion.version == KnowledgeDocument.current_version,
+            KnowledgeDocument.status == KnowledgeDocumentStatus.ACTIVE,
+            or_(*term_matches),
+        )
+    )
+    if request.document_ids is not None:
+        statement = statement.where(
+            KnowledgeDocument.id.in_(request.document_ids)
+        )
+    rows = db.execute(
+        statement.order_by(
+            matched_term_count.desc(),
+            KnowledgeDocument.name.asc(),
+            KnowledgeChunk.chunk_index.asc(),
+        ).limit(request.limit)
+    ).all()
+    hits = [
+        KnowledgeSearchHit(
+            document_id=document.id,
+            document_name=document.name,
+            source=document.source,
+            version=version.version,
+            chunk_index=chunk.chunk_index,
+            text=chunk.content,
+            score=matched_count / len(terms),
+        )
+        for chunk, version, document, matched_count in rows
+    ]
+    audit(
+        db,
+        tenant_id=tenant_id,
+        actor=actor,
+        action="KNOWLEDGE_SEARCH_COMPLETED",
+        resource_type="KnowledgeDocument",
+        resource_id=None,
+        outcome="SUCCESS",
+        detail={"hit_count": len(hits)},
+    )
+    db.commit()
+    return KnowledgeSearchResponse(query=request.query, hits=hits)
+
+
+@router.post(
+    "/intelligence/assessments",
+    response_model=DecisionAssessmentResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_intelligence_assessment(
+    request: DecisionAssessmentCreate,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.intelligence.analyze")),
+) -> DecisionAssessmentResponse:
+    actor, tenant_id = identity
+    assessment = IntelligenceAssessment(
+        tenant_id=tenant_id,
+        title=request.title,
+        objective=request.objective,
+        input_snapshot=request.model_dump(mode="json"),
+        result_snapshot={},
+        created_by=actor,
+    )
+    db.add(assessment)
+    db.flush()
+    result = analyze_decision(
+        request,
+        assessment_id=assessment.id,
+        actor=actor,
+        created_at=assessment.created_at,
+    )
+    assessment.result_snapshot = result.model_dump(mode="json")
+    audit(
+        db,
+        tenant_id=tenant_id,
+        actor=actor,
+        action="INTELLIGENCE_ASSESSMENT_CREATED",
+        resource_type="IntelligenceAssessment",
+        resource_id=assessment.id,
+        outcome="SUCCESS",
+        detail={
+            "criterion_count": len(request.criteria),
+            "alternative_count": len(request.alternatives),
+            "method": "WEIGHTED_SCORE_WITH_SEPARATE_RISK_MATRIX",
+        },
+    )
+    db.commit()
+    return result
+
+
+@router.get(
+    "/intelligence/assessments",
+    response_model=list[DecisionAssessmentListItem],
+)
+def list_intelligence_assessments(
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.intelligence.read")),
+    limit: int = Query(default=100, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> list[DecisionAssessmentListItem]:
+    _actor, tenant_id = identity
+    assessments = db.scalars(
+        select(IntelligenceAssessment)
+        .where(IntelligenceAssessment.tenant_id == tenant_id)
+        .order_by(
+            IntelligenceAssessment.created_at.desc(),
+            IntelligenceAssessment.id.desc(),
+        )
+        .offset(offset)
+        .limit(limit)
+    )
+    return [
+        DecisionAssessmentListItem(
+            id=assessment.id,
+            title=assessment.title,
+            created_by=assessment.created_by,
+            created_at=assessment.created_at,
+            criterion_count=len(assessment.input_snapshot["criteria"]),
+            alternative_count=len(assessment.input_snapshot["alternatives"]),
+        )
+        for assessment in assessments
+    ]
+
+
+@router.get(
+    "/intelligence/assessments/{assessment_id}",
+    response_model=DecisionAssessmentResponse,
+)
+def get_intelligence_assessment(
+    assessment_id: str,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.intelligence.read")),
+) -> DecisionAssessmentResponse:
+    _actor, tenant_id = identity
+    assessment = db.scalar(
+        select(IntelligenceAssessment).where(
+            IntelligenceAssessment.id == assessment_id,
+            IntelligenceAssessment.tenant_id == tenant_id,
+        )
+    )
+    if assessment is None:
+        raise HTTPException(status_code=404, detail="Intelligence assessment not found")
+    return DecisionAssessmentResponse.model_validate(assessment.result_snapshot)
+
+
+def automation_workflow_run_response(
+    run: AutomationWorkflowRun,
+) -> AutomationWorkflowRunResponse:
+    return AutomationWorkflowRunResponse(
+        id=run.id,
+        workflow_id=run.workflow_id,
+        workflow_version=run.workflow_version,
+        task_id=run.task_id,
+        status=run.status,
+        input=run.input,
+        step_results=run.step_results,
+        result=run.result_snapshot,
+        failure_reason=run.failure_reason,
+        scheduled_at=run.scheduled_at,
+        created_by=run.created_by,
+        created_at=run.created_at,
+    )
+
+
+@router.post(
+    "/workflows",
+    response_model=AutomationWorkflowResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_automation_workflow(
+    request: AutomationWorkflowCreate,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.workflow.manage")),
+) -> AutomationWorkflow:
+    actor, tenant_id = identity
+    existing = db.scalar(
+        select(AutomationWorkflow).where(
+            AutomationWorkflow.tenant_id == tenant_id,
+            AutomationWorkflow.name == request.name,
+        )
+    )
+    if existing is not None:
+        raise HTTPException(status_code=409, detail="Workflow name already exists")
+    workflow = AutomationWorkflow(
+        tenant_id=tenant_id,
+        name=request.name,
+        description=request.description,
+        steps=[step.model_dump(mode="json") for step in request.steps],
+        version=1,
+        status=request.status,
+        created_by=actor,
+    )
+    try:
+        db.add(workflow)
+        db.flush()
+        audit(
+            db,
+            tenant_id=tenant_id,
+            actor=actor,
+            action="WORKFLOW_CREATED",
+            resource_type="AutomationWorkflow",
+            resource_id=workflow.id,
+            outcome="SUCCESS",
+            detail={
+                "name": workflow.name,
+                "status": workflow.status.value,
+                "version": workflow.version,
+                "step_count": len(workflow.steps),
+            },
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Workflow name already exists") from exc
+    db.refresh(workflow)
+    return workflow
+
+
+@router.get(
+    "/workflows",
+    response_model=list[AutomationWorkflowResponse],
+)
+def list_automation_workflows(
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.workflow.read")),
+    workflow_status: AutomationWorkflowStatus | None = Query(
+        default=None,
+        alias="status",
+    ),
+    limit: int = Query(default=100, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> list[AutomationWorkflow]:
+    _actor, tenant_id = identity
+    statement = select(AutomationWorkflow).where(
+        AutomationWorkflow.tenant_id == tenant_id
+    )
+    if workflow_status is not None:
+        statement = statement.where(AutomationWorkflow.status == workflow_status)
+    return list(
+        db.scalars(
+            statement.order_by(AutomationWorkflow.name.asc())
+            .offset(offset)
+            .limit(limit)
+        )
+    )
+
+
+@router.get(
+    "/workflows/{workflow_id}",
+    response_model=AutomationWorkflowResponse,
+)
+def get_automation_workflow(
+    workflow_id: str,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.workflow.read")),
+) -> AutomationWorkflow:
+    _actor, tenant_id = identity
+    workflow = db.scalar(
+        select(AutomationWorkflow).where(
+            AutomationWorkflow.id == workflow_id,
+            AutomationWorkflow.tenant_id == tenant_id,
+        )
+    )
+    if workflow is None:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    return workflow
+
+
+@router.patch(
+    "/workflows/{workflow_id}",
+    response_model=AutomationWorkflowResponse,
+)
+def update_automation_workflow(
+    workflow_id: str,
+    request: AutomationWorkflowUpdate,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.workflow.manage")),
+) -> AutomationWorkflow:
+    actor, tenant_id = identity
+    workflow = db.scalar(
+        select(AutomationWorkflow)
+        .where(
+            AutomationWorkflow.id == workflow_id,
+            AutomationWorkflow.tenant_id == tenant_id,
+        )
+        .with_for_update()
+    )
+    if workflow is None:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    updates = request.model_dump(exclude_unset=True)
+    if "steps" in updates:
+        new_steps = [step.model_dump(mode="json") for step in request.steps or []]
+        if new_steps != workflow.steps:
+            workflow.version += 1
+        updates["steps"] = new_steps
+    for field, value in updates.items():
+        setattr(workflow, field, value)
+    workflow.updated_at = utcnow()
+    audit(
+        db,
+        tenant_id=tenant_id,
+        actor=actor,
+        action="WORKFLOW_UPDATED",
+        resource_type="AutomationWorkflow",
+        resource_id=workflow.id,
+        outcome="SUCCESS",
+        detail={
+            "fields": sorted(updates),
+            "version": workflow.version,
+        },
+    )
+    db.commit()
+    db.refresh(workflow)
+    return workflow
+
+
+@router.post(
+    "/workflows/{workflow_id}/runs",
+    response_model=AutomationWorkflowRunResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def create_automation_workflow_run(
+    workflow_id: str,
+    request: AutomationWorkflowRunCreate,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.workflow.run")),
+) -> AutomationWorkflowRunResponse:
+    actor, tenant_id = identity
+    workflow = db.scalar(
+        select(AutomationWorkflow).where(
+            AutomationWorkflow.id == workflow_id,
+            AutomationWorkflow.tenant_id == tenant_id,
+        )
+    )
+    if workflow is None:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    if workflow.status != AutomationWorkflowStatus.ACTIVE:
+        raise HTTPException(status_code=409, detail="Workflow is not active")
+    if emergency_stop(db, tenant_id).active:
+        raise HTTPException(status_code=409, detail="Emergency stop is active")
+
+    scheduled_at = utcnow() + timedelta(seconds=request.delay_seconds)
+    task = ControlTask(
+        tenant_id=tenant_id,
+        title=f"Workflow: {workflow.name}",
+        description=f"Workflow run version {workflow.version}",
+        status=TaskStatus.PENDING,
+        created_by=actor,
+    )
+    db.add(task)
+    db.flush()
+    run = AutomationWorkflowRun(
+        task_id=task.id,
+        workflow_id=workflow.id,
+        tenant_id=tenant_id,
+        workflow_version=workflow.version,
+        input=request.input,
+        steps_snapshot=workflow.steps,
+        step_results=[],
+        status=AutomationWorkflowRunStatus.QUEUED,
+        scheduled_at=scheduled_at,
+        created_by=actor,
+    )
+    db.add(run)
+    db.flush()
+    db.add(
+        TaskWorkItem(
+            task_id=task.id,
+            tenant_id=tenant_id,
+            work_type="automation.workflow",
+            payload={"workflow_run_id": run.id},
+            status=WorkItemStatus.PENDING,
+            available_at=scheduled_at,
+        )
+    )
+    audit(
+        db,
+        tenant_id=tenant_id,
+        actor=actor,
+        action="WORKFLOW_RUN_QUEUED",
+        resource_type="AutomationWorkflowRun",
+        resource_id=run.id,
+        outcome="SUCCESS",
+        detail={
+            "workflow_id": workflow.id,
+            "workflow_version": workflow.version,
+            "delay_seconds": request.delay_seconds,
+            "step_count": len(workflow.steps),
+        },
+    )
+    db.commit()
+    db.refresh(run)
+    return automation_workflow_run_response(run)
+
+
+@router.get(
+    "/workflows/{workflow_id}/runs",
+    response_model=list[AutomationWorkflowRunResponse],
+)
+def list_automation_workflow_runs(
+    workflow_id: str,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.workflow.read")),
+    limit: int = Query(default=100, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> list[AutomationWorkflowRunResponse]:
+    _actor, tenant_id = identity
+    workflow = db.scalar(
+        select(AutomationWorkflow).where(
+            AutomationWorkflow.id == workflow_id,
+            AutomationWorkflow.tenant_id == tenant_id,
+        )
+    )
+    if workflow is None:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    runs = db.scalars(
+        select(AutomationWorkflowRun)
+        .where(
+            AutomationWorkflowRun.workflow_id == workflow.id,
+            AutomationWorkflowRun.tenant_id == tenant_id,
+        )
+        .order_by(
+            AutomationWorkflowRun.created_at.desc(),
+            AutomationWorkflowRun.id.desc(),
+        )
+        .offset(offset)
+        .limit(limit)
+    )
+    return [automation_workflow_run_response(run) for run in runs]
+
+
+@router.get(
+    "/workflow-runs/{run_id}",
+    response_model=AutomationWorkflowRunResponse,
+)
+def get_automation_workflow_run(
+    run_id: str,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.workflow.read")),
+) -> AutomationWorkflowRunResponse:
+    _actor, tenant_id = identity
+    run = db.scalar(
+        select(AutomationWorkflowRun).where(
+            AutomationWorkflowRun.id == run_id,
+            AutomationWorkflowRun.tenant_id == tenant_id,
+        )
+    )
+    if run is None:
+        raise HTTPException(status_code=404, detail="Workflow run not found")
+    return automation_workflow_run_response(run)
+
+
+def _get_agent_for_tenant(
+    db: Session,
+    *,
+    agent_id: str,
+    tenant_id: str,
+) -> AIAgent:
+    agent = db.scalar(
+        select(AIAgent).where(
+            AIAgent.id == agent_id,
+            AIAgent.tenant_id == tenant_id,
+        )
+    )
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return agent
+
+
+@router.post(
+    "/agents",
+    response_model=AIAgentResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_agent(
+    request: AIAgentCreate,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.agent.manage")),
+) -> AIAgent:
+    actor, tenant_id = identity
+    existing = db.scalar(
+        select(AIAgent).where(
+            AIAgent.tenant_id == tenant_id,
+            AIAgent.name == request.name,
+        )
+    )
+    if existing is not None:
+        raise HTTPException(status_code=409, detail="Agent name already exists")
+
+    agent = AIAgent(
+        tenant_id=tenant_id,
+        name=request.name,
+        agent_type=request.agent_type,
+        description=request.description,
+        instructions=request.instructions,
+        capabilities=request.capabilities,
+        tools=[tool.model_dump(mode="json") for tool in request.tools],
+        preferred_provider=request.preferred_provider,
+        status=request.status,
+        created_by=actor,
+    )
+    try:
+        db.add(agent)
+        db.flush()
+        audit(
+            db,
+            tenant_id=tenant_id,
+            actor=actor,
+            action="AGENT_CREATED",
+            resource_type="AIAgent",
+            resource_id=agent.id,
+            outcome="SUCCESS",
+            detail={
+                "name": agent.name,
+                "agent_type": agent.agent_type,
+                "status": agent.status.value,
+            },
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Agent name already exists") from exc
+    db.refresh(agent)
+    return agent
+
+
+@router.get("/agents", response_model=list[AIAgentResponse])
+def list_agents(
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.agent.read")),
+    agent_status: AgentStatus | None = Query(default=None, alias="status"),
+    limit: int = Query(default=100, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> list[AIAgent]:
+    _actor, tenant_id = identity
+    statement = select(AIAgent).where(AIAgent.tenant_id == tenant_id)
+    if agent_status is not None:
+        statement = statement.where(AIAgent.status == agent_status)
+    return list(
+        db.scalars(
+            statement.order_by(AIAgent.name.asc()).offset(offset).limit(limit)
+        )
+    )
+
+
+@router.get("/agents/{agent_id}", response_model=AIAgentResponse)
+def get_agent(
+    agent_id: str,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.agent.read")),
+) -> AIAgent:
+    _actor, tenant_id = identity
+    return _get_agent_for_tenant(db, agent_id=agent_id, tenant_id=tenant_id)
+
+
+@router.patch("/agents/{agent_id}", response_model=AIAgentResponse)
+def update_agent(
+    agent_id: str,
+    request: AIAgentUpdate,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.agent.manage")),
+) -> AIAgent:
+    actor, tenant_id = identity
+    agent = _get_agent_for_tenant(db, agent_id=agent_id, tenant_id=tenant_id)
+    updates = request.model_dump(exclude_unset=True)
+    if "tools" in updates:
+        updates["tools"] = [tool.model_dump(mode="json") for tool in request.tools or []]
+    for field, value in updates.items():
+        setattr(agent, field, value)
+    audit(
+        db,
+        tenant_id=tenant_id,
+        actor=actor,
+        action="AGENT_UPDATED",
+        resource_type="AIAgent",
+        resource_id=agent.id,
+        outcome="SUCCESS",
+        detail={"fields": sorted(updates)},
+    )
+    db.commit()
+    db.refresh(agent)
+    return agent
+
+
+@router.post(
+    "/agents/{agent_id}/run",
+    response_model=AIAgentRunResponse,
+)
+def run_agent(
+    agent_id: str,
+    request: AIAgentRunRequest,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.agent.run")),
+    provider: InferenceProvider = Depends(get_inference_provider),
+) -> AIAgentRunResponse:
+    actor, tenant_id = identity
+    agent = _get_agent_for_tenant(db, agent_id=agent_id, tenant_id=tenant_id)
+    if agent.status != AgentStatus.ENABLED:
+        raise HTTPException(status_code=409, detail="Agent is not enabled")
+    inference = _run_inference(
+        InferenceRequest(
+            messages=[
+                AIMessage(role="system", content=agent.instructions),
+                AIMessage(role="user", content=request.prompt),
+            ],
+            provider=agent.preferred_provider,
+            conversation_id=request.conversation_id,
+            response_format=request.response_format,
+            tools=[AITool.model_validate(tool) for tool in agent.tools],
+        ),
+        db,
+        identity,
+        provider,
+    )
+    audit(
+        db,
+        tenant_id=tenant_id,
+        actor=actor,
+        action="AGENT_RUN_COMPLETED",
+        resource_type="AIAgent",
+        resource_id=agent.id,
+        outcome="SUCCESS",
+        detail={
+            "agent_type": agent.agent_type,
+            "model_id": inference.model_id,
+            "provider": inference.provider,
+        },
+    )
+    db.commit()
+    return AIAgentRunResponse(
+        agent_id=agent.id,
+        agent_name=agent.name,
+        inference=inference,
+    )
+
+
+@router.post(
+    "/agents/orchestrate",
+    response_model=AIAgentOrchestrationResponse,
+)
+def orchestrate_agents(
+    request: AIAgentOrchestrationRequest,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.agent.run")),
+    provider: InferenceProvider = Depends(get_inference_provider),
+) -> AIAgentOrchestrationResponse:
+    actor, tenant_id = identity
+    agents = [
+        _get_agent_for_tenant(db, agent_id=agent_id, tenant_id=tenant_id)
+        for agent_id in request.agent_ids
+    ]
+    if any(agent.status != AgentStatus.ENABLED for agent in agents):
+        raise HTTPException(status_code=409, detail="All agents must be enabled")
+
+    steps = []
+    for agent in agents:
+        inference = _run_inference(
+            InferenceRequest(
+                messages=[
+                    AIMessage(role="system", content=agent.instructions),
+                    AIMessage(role="user", content=request.prompt),
+                ],
+                provider=agent.preferred_provider,
+                tools=[AITool.model_validate(tool) for tool in agent.tools],
+            ),
+            db,
+            identity,
+            provider,
+        )
+        audit(
+            db,
+            tenant_id=tenant_id,
+            actor=actor,
+            action="AGENT_RUN_COMPLETED",
+            resource_type="AIAgent",
+            resource_id=agent.id,
+            outcome="SUCCESS",
+            detail={
+                "agent_type": agent.agent_type,
+                "model_id": inference.model_id,
+                "provider": inference.provider,
+                "orchestration": True,
+            },
+        )
+        db.commit()
+        steps.append(
+            AIAgentOrchestrationStep(
+                agent_id=agent.id,
+                agent_name=agent.name,
+                content=inference.content,
+            )
+        )
+    return AIAgentOrchestrationResponse(steps=steps)
 
 
 @router.post("/ai/infer", response_model=InferenceResponse)

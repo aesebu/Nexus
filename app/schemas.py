@@ -1,6 +1,8 @@
 import json
 import re
 from datetime import datetime
+from decimal import Decimal
+import math
 from typing import Any, Literal
 
 from pydantic import (
@@ -16,6 +18,12 @@ from pydantic import (
 from app.models import (
     AIModelHealthStatus,
     AIModelStatus,
+    AgentStatus,
+    AutomationWorkflowRunStatus,
+    AutomationWorkflowStatus,
+    KnowledgeDocumentStatus,
+    KnowledgeSourceCredibility,
+    KnowledgeSourceStatus,
     CommandStatus,
     RegistryStatus,
     TaskStatus,
@@ -417,11 +425,45 @@ class AIMessage(BaseModel):
     content: str = Field(min_length=1, max_length=32_000)
 
 
+class AIToolFunction(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    description: str | None = Field(default=None, max_length=2_000)
+    parameters: dict[str, Any] = Field(default_factory=dict)
+
+
+class AITool(BaseModel):
+    type: Literal["function"]
+    function: AIToolFunction
+
+
+class AIToolCall(BaseModel):
+    id: str
+    type: Literal["function"]
+    function: dict[str, str]
+
+
+class AIResponseFormat(BaseModel):
+    type: Literal["json_object", "json_schema"]
+    json_schema: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def validate_schema(self) -> "AIResponseFormat":
+        if self.type == "json_schema":
+            if self.json_schema is None:
+                raise ValueError("json_schema is required for json_schema response format")
+            if not isinstance(self.json_schema.get("schema"), dict):
+                raise ValueError("json_schema.schema must be an object")
+        return self
+
+
 class InferenceRequest(BaseModel):
     messages: list[AIMessage] = Field(min_length=1, max_length=100)
     provider: str | None = Field(default=None, min_length=1, max_length=128)
     temperature: float = Field(default=0.7, ge=0, le=2)
     max_tokens: int = Field(default=1024, ge=1, le=8192)
+    conversation_id: str | None = Field(default=None, min_length=36, max_length=36)
+    response_format: AIResponseFormat | None = None
+    tools: list[AITool] = Field(default_factory=list, max_length=32)
 
 
 class NexusChatMessage(BaseModel):
@@ -434,6 +476,9 @@ class NexusChatRequest(BaseModel):
     provider: str | None = Field(default=None, min_length=1, max_length=128)
     temperature: float = Field(default=0.7, ge=0, le=2)
     max_tokens: int = Field(default=1024, ge=1, le=8192)
+    conversation_id: str | None = Field(default=None, min_length=36, max_length=36)
+    response_format: AIResponseFormat | None = None
+    tools: list[AITool] = Field(default_factory=list, max_length=32)
 
     @model_validator(mode="after")
     def requires_user_message_last(self) -> "NexusChatRequest":
@@ -450,3 +495,623 @@ class InferenceResponse(BaseModel):
     content: str
     input_tokens: int | None
     output_tokens: int | None
+    conversation_id: str | None = None
+    tool_calls: list[AIToolCall] = Field(default_factory=list)
+    structured_output: dict[str, Any] | list[Any] | None = None
+
+
+class AIConversationCreate(BaseModel):
+    title: str | None = Field(default=None, max_length=200)
+
+
+class AIConversationResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    tenant_id: str
+    created_by: str
+    title: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class AIConversationMessageResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    conversation_id: str
+    tenant_id: str
+    sequence: int
+    role: str
+    content: str
+    created_at: datetime
+
+
+class AIAgentCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    agent_type: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z][a-z0-9_]*$",
+    )
+    description: str | None = Field(default=None, max_length=500)
+    instructions: str = Field(min_length=1, max_length=12_000)
+    capabilities: list[str] = Field(default_factory=list, max_length=32)
+    tools: list[AITool] = Field(default_factory=list, max_length=16)
+    preferred_provider: str | None = Field(default=None, min_length=1, max_length=128)
+    status: AgentStatus = AgentStatus.REGISTERED
+
+    @field_validator("capabilities")
+    @classmethod
+    def unique_capabilities(cls, value: list[str]) -> list[str]:
+        if any(not item or len(item) > 128 for item in value):
+            raise ValueError("Capabilities must be non-empty and at most 128 characters")
+        if len(set(value)) != len(value):
+            raise ValueError("Capabilities must be unique")
+        return value
+
+    @field_validator("tools")
+    @classmethod
+    def unique_tool_names(cls, value: list[AITool]) -> list[AITool]:
+        names = [tool.function.name for tool in value]
+        if len(set(names)) != len(names):
+            raise ValueError("Tool names must be unique")
+        return value
+
+
+class AIAgentUpdate(BaseModel):
+    description: str | None = Field(default=None, max_length=500)
+    instructions: str | None = Field(default=None, min_length=1, max_length=12_000)
+    capabilities: list[str] | None = Field(default=None, max_length=32)
+    tools: list[AITool] | None = Field(default=None, max_length=16)
+    preferred_provider: str | None = Field(default=None, min_length=1, max_length=128)
+    status: AgentStatus | None = None
+
+    @field_validator("capabilities", "tools", "status", mode="before")
+    @classmethod
+    def reject_null_agent_fields(cls, value: Any) -> Any:
+        if value is None:
+            raise ValueError("Agent fields cannot be null")
+        return value
+
+    @field_validator("capabilities")
+    @classmethod
+    def unique_capabilities(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return value
+        if any(not item or len(item) > 128 for item in value):
+            raise ValueError("Capabilities must be non-empty and at most 128 characters")
+        if len(set(value)) != len(value):
+            raise ValueError("Capabilities must be unique")
+        return value
+
+    @field_validator("tools")
+    @classmethod
+    def unique_tool_names(cls, value: list[AITool] | None) -> list[AITool] | None:
+        if value is None:
+            return value
+        names = [tool.function.name for tool in value]
+        if len(set(names)) != len(names):
+            raise ValueError("Tool names must be unique")
+        return value
+
+
+class AIAgentResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    tenant_id: str
+    name: str
+    agent_type: str
+    description: str | None
+    instructions: str
+    capabilities: list[str]
+    tools: list[AITool]
+    preferred_provider: str | None
+    status: AgentStatus
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class AIAgentRunRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=32_000)
+    conversation_id: str | None = Field(default=None, min_length=36, max_length=36)
+    response_format: AIResponseFormat | None = None
+
+
+class AIAgentRunResponse(BaseModel):
+    agent_id: str
+    agent_name: str
+    inference: InferenceResponse
+
+
+class AIAgentOrchestrationRequest(BaseModel):
+    agent_ids: list[str] = Field(min_length=1, max_length=5)
+    prompt: str = Field(min_length=1, max_length=32_000)
+
+    @field_validator("agent_ids")
+    @classmethod
+    def unique_agent_ids(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("Agent IDs must be unique")
+        return value
+
+
+class AIAgentOrchestrationStep(BaseModel):
+    agent_id: str
+    agent_name: str
+    content: str
+
+
+class AIAgentOrchestrationResponse(BaseModel):
+    steps: list[AIAgentOrchestrationStep]
+
+
+class KnowledgeDocumentCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=500)
+    source: str = Field(min_length=1, max_length=500)
+    content: str = Field(min_length=1, max_length=256 * 1024)
+    status: KnowledgeDocumentStatus = KnowledgeDocumentStatus.DRAFT
+
+
+class KnowledgeDocumentUpdate(BaseModel):
+    description: str | None = Field(default=None, max_length=500)
+    source: str | None = Field(default=None, min_length=1, max_length=500)
+    content: str | None = Field(default=None, min_length=1, max_length=256 * 1024)
+    status: KnowledgeDocumentStatus | None = None
+
+    @field_validator("source", "content", "status", mode="before")
+    @classmethod
+    def reject_null_document_fields(cls, value: Any) -> Any:
+        if value is None:
+            raise ValueError("Document fields cannot be null")
+        return value
+
+    @model_validator(mode="after")
+    def requires_update_field(self) -> "KnowledgeDocumentUpdate":
+        if not self.model_fields_set:
+            raise ValueError("At least one document field must be provided")
+        return self
+
+
+class KnowledgeDocumentResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    tenant_id: str
+    name: str
+    description: str | None
+    source: str
+    status: KnowledgeDocumentStatus
+    current_version: int
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class KnowledgeDocumentContentResponse(BaseModel):
+    document: KnowledgeDocumentResponse
+    version: int
+    content: str
+
+
+class KnowledgeDocumentVersionResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    document_id: str
+    version: int
+    created_by: str
+    created_at: datetime
+
+
+class KnowledgeSearchRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=1_000)
+    document_ids: list[str] | None = Field(default=None, max_length=50)
+    limit: int = Field(default=5, ge=1, le=20)
+
+    @field_validator("document_ids")
+    @classmethod
+    def unique_document_ids(cls, value: list[str] | None) -> list[str] | None:
+        if value is not None and len(set(value)) != len(value):
+            raise ValueError("Document IDs must be unique")
+        return value
+
+    @field_validator("query")
+    @classmethod
+    def validate_query_terms(cls, value: str) -> str:
+        value = value.strip()
+        terms = re.findall(r"\w+", value)
+        if not terms:
+            raise ValueError("Query must contain searchable text")
+        if len(terms) > 32:
+            raise ValueError("Query cannot contain more than 32 search terms")
+        return value
+
+
+class KnowledgeSearchHit(BaseModel):
+    document_id: str
+    document_name: str
+    source: str
+    version: int
+    chunk_index: int
+    text: str
+    score: float
+
+
+class KnowledgeSearchResponse(BaseModel):
+    query: str
+    hits: list[KnowledgeSearchHit]
+
+
+class KnowledgeSourceCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    url: str | None = Field(default=None, max_length=2_048)
+    source_type: str = Field(min_length=1, max_length=64)
+    knowledge_domains: list[str] = Field(default_factory=list, max_length=50)
+    credibility: KnowledgeSourceCredibility = KnowledgeSourceCredibility.S5
+    status: KnowledgeSourceStatus = KnowledgeSourceStatus.DISCOVERED
+    access_method: str = Field(min_length=1, max_length=64)
+    license: str | None = Field(default=None, max_length=500)
+    update_frequency: str | None = Field(default=None, max_length=64)
+    security_risk: str = Field(default="NOT_ASSESSED", max_length=500)
+    research_status: str = Field(default="PENDING", max_length=64)
+
+    @field_validator("knowledge_domains")
+    @classmethod
+    def validate_domains(cls, value: list[str]) -> list[str]:
+        normalized = [domain.strip() for domain in value if domain.strip()]
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("Knowledge domains must be unique")
+        return normalized
+
+
+class KnowledgeSourceUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    url: str | None = Field(default=None, max_length=2_048)
+    source_type: str | None = Field(default=None, min_length=1, max_length=64)
+    knowledge_domains: list[str] | None = Field(default=None, max_length=50)
+    credibility: KnowledgeSourceCredibility | None = None
+    status: KnowledgeSourceStatus | None = None
+    access_method: str | None = Field(default=None, min_length=1, max_length=64)
+    license: str | None = Field(default=None, max_length=500)
+    update_frequency: str | None = Field(default=None, max_length=64)
+    security_risk: str | None = Field(default=None, max_length=500)
+    research_status: str | None = Field(default=None, max_length=64)
+
+    @model_validator(mode="after")
+    def requires_update_field(self) -> "KnowledgeSourceUpdate":
+        if not self.model_fields_set:
+            raise ValueError("At least one source field must be provided")
+        return self
+
+    @field_validator("knowledge_domains")
+    @classmethod
+    def validate_domains(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return value
+        normalized = [domain.strip() for domain in value if domain.strip()]
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("Knowledge domains must be unique")
+        return normalized
+
+
+class KnowledgeSourceResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    tenant_id: str
+    name: str
+    url: str | None
+    source_type: str
+    knowledge_domains: list[str]
+    credibility: KnowledgeSourceCredibility
+    status: KnowledgeSourceStatus
+    access_method: str
+    license: str | None
+    update_frequency: str | None
+    security_risk: str
+    research_status: str
+    last_verified_at: datetime | None
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class DecisionCriterion(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    weight: float = Field(gt=0, le=1, strict=True)
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Criterion name cannot be blank")
+        return value
+
+    @field_validator("weight")
+    @classmethod
+    def require_finite_weight(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("Criterion weight must be finite")
+        return value
+
+
+class DecisionRiskFactor(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    probability: int = Field(ge=1, le=5, strict=True)
+    impact: int = Field(ge=1, le=5, strict=True)
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Risk factor name cannot be blank")
+        return value
+
+
+class DecisionAlternative(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    scores: dict[str, int]
+    risks: list[DecisionRiskFactor] = Field(default_factory=list, max_length=20)
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Alternative name cannot be blank")
+        return value
+
+    @field_validator("scores", mode="before")
+    @classmethod
+    def validate_scores(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or not value:
+            raise ValueError("Alternative scores cannot be empty")
+        if any(
+            not isinstance(score, int)
+            or isinstance(score, bool)
+            or not 0 <= score <= 100
+            for score in value.values()
+        ):
+            raise ValueError("Criterion scores must be between 0 and 100")
+        return value
+
+    @field_validator("risks")
+    @classmethod
+    def unique_risk_names(
+        cls, value: list[DecisionRiskFactor]
+    ) -> list[DecisionRiskFactor]:
+        names = [risk.name.casefold() for risk in value]
+        if len(set(names)) != len(names):
+            raise ValueError("Risk factor names must be unique per alternative")
+        return value
+
+
+class DecisionAssessmentCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    objective: str = Field(min_length=1, max_length=4_000)
+    criteria: list[DecisionCriterion] = Field(min_length=1, max_length=20)
+    alternatives: list[DecisionAlternative] = Field(min_length=2, max_length=10)
+
+    @field_validator("title", "objective")
+    @classmethod
+    def normalize_required_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Text fields cannot be blank")
+        return value
+
+    @model_validator(mode="after")
+    def validate_assessment(self) -> "DecisionAssessmentCreate":
+        criterion_names = [criterion.name.casefold() for criterion in self.criteria]
+        if len(set(criterion_names)) != len(criterion_names):
+            raise ValueError("Criterion names must be unique")
+        weight_total = sum(
+            (Decimal(str(criterion.weight)) for criterion in self.criteria),
+            Decimal(0),
+        )
+        if abs(weight_total - Decimal(1)) > Decimal("0.000001"):
+            raise ValueError("Criterion weights must sum to 1")
+
+        alternative_names = [alternative.name.casefold() for alternative in self.alternatives]
+        if len(set(alternative_names)) != len(alternative_names):
+            raise ValueError("Alternative names must be unique")
+        expected = {criterion.name for criterion in self.criteria}
+        for alternative in self.alternatives:
+            if set(alternative.scores) != expected:
+                raise ValueError(
+                    "Each alternative must provide exactly one score per criterion"
+                )
+        return self
+
+
+class DecisionCriterionResult(BaseModel):
+    name: str
+    weight: float
+    score: int
+    contribution: float
+
+
+class DecisionRiskResult(BaseModel):
+    name: str
+    probability: int
+    impact: int
+    exposure: int
+    level: Literal["LOW", "MODERATE", "HIGH", "CRITICAL"]
+
+
+class DecisionAlternativeResult(BaseModel):
+    name: str
+    rank: int
+    weighted_score: float
+    criteria: list[DecisionCriterionResult]
+    risk_score: int
+    risk_level: Literal["NONE", "LOW", "MODERATE", "HIGH", "CRITICAL"]
+    risks: list[DecisionRiskResult]
+
+
+class DecisionAssessmentResponse(BaseModel):
+    id: str
+    title: str
+    objective: str
+    criteria: list[DecisionCriterion]
+    alternatives: list[DecisionAlternativeResult]
+    created_by: str
+    created_at: datetime
+
+
+class DecisionAssessmentListItem(BaseModel):
+    id: str
+    title: str
+    created_by: str
+    created_at: datetime
+    criterion_count: int
+    alternative_count: int
+
+
+class WorkflowCondition(BaseModel):
+    path: str = Field(
+        min_length=1,
+        max_length=256,
+        pattern=r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$",
+    )
+    equals: Any
+
+    @field_validator("equals")
+    @classmethod
+    def validate_condition_value(cls, value: Any) -> Any:
+        try:
+            serialized = json.dumps(
+                value,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Workflow condition value must be JSON-compatible") from exc
+        if len(serialized.encode("utf-8")) > 4 * 1024:
+            raise ValueError("Workflow condition value must not exceed 4 KiB")
+        return value
+
+
+class AutomationWorkflowStep(BaseModel):
+    id: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z][a-z0-9_-]*$",
+    )
+    prompt: str = Field(min_length=1, max_length=10_000)
+    system_prompt: str | None = Field(default=None, max_length=4_000)
+    provider: str | None = Field(default=None, min_length=1, max_length=128)
+    temperature: float = Field(default=0.7, ge=0, le=2)
+    max_tokens: int = Field(default=1024, ge=1, le=8192)
+    response_format: AIResponseFormat | None = None
+    condition: WorkflowCondition | None = None
+
+
+class AutomationWorkflowCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    description: str | None = Field(default=None, max_length=500)
+    steps: list[AutomationWorkflowStep] = Field(min_length=1, max_length=10)
+    status: AutomationWorkflowStatus = AutomationWorkflowStatus.DRAFT
+
+    @field_validator("steps")
+    @classmethod
+    def unique_step_ids(
+        cls, value: list[AutomationWorkflowStep]
+    ) -> list[AutomationWorkflowStep]:
+        step_ids = [step.id for step in value]
+        if len(set(step_ids)) != len(step_ids):
+            raise ValueError("Workflow step IDs must be unique")
+        return value
+
+
+class AutomationWorkflowUpdate(BaseModel):
+    description: str | None = Field(default=None, max_length=500)
+    steps: list[AutomationWorkflowStep] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=10,
+    )
+    status: AutomationWorkflowStatus | None = None
+
+    @field_validator("steps", "status", mode="before")
+    @classmethod
+    def reject_null_workflow_fields(cls, value: Any) -> Any:
+        if value is None:
+            raise ValueError("Workflow fields cannot be null")
+        return value
+
+    @field_validator("steps")
+    @classmethod
+    def unique_step_ids(
+        cls, value: list[AutomationWorkflowStep] | None
+    ) -> list[AutomationWorkflowStep] | None:
+        if value is None:
+            return value
+        step_ids = [step.id for step in value]
+        if len(set(step_ids)) != len(step_ids):
+            raise ValueError("Workflow step IDs must be unique")
+        return value
+
+    @model_validator(mode="after")
+    def requires_update_field(self) -> "AutomationWorkflowUpdate":
+        if not self.model_fields_set:
+            raise ValueError("At least one workflow field must be provided")
+        return self
+
+
+class AutomationWorkflowResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    tenant_id: str
+    name: str
+    description: str | None
+    steps: list[AutomationWorkflowStep]
+    version: int
+    status: AutomationWorkflowStatus
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class AutomationWorkflowRunCreate(BaseModel):
+    input: dict[str, Any] = Field(default_factory=dict)
+    delay_seconds: int = Field(default=0, ge=0, le=30 * 24 * 60 * 60)
+
+    @field_validator("input")
+    @classmethod
+    def validate_input_size(cls, value: dict[str, Any]) -> dict[str, Any]:
+        try:
+            serialized = json.dumps(
+                value,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Workflow input must be JSON-compatible") from exc
+        if len(serialized.encode("utf-8")) > 16 * 1024:
+            raise ValueError("Workflow input must not exceed 16 KiB")
+        return value
+
+
+class AutomationWorkflowRunResponse(BaseModel):
+    id: str
+    workflow_id: str
+    workflow_version: int
+    task_id: str
+    status: AutomationWorkflowRunStatus
+    input: dict[str, Any]
+    step_results: list[dict[str, Any]]
+    result: dict[str, Any] | None
+    failure_reason: str | None
+    scheduled_at: datetime
+    created_by: str
+    created_at: datetime

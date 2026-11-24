@@ -27,13 +27,20 @@ from app.models import (
     AIModel,
     AIModelStatus,
     AuditEvent,
+    AutomationWorkflowRun,
+    AutomationWorkflowRunStatus,
     ControlTask,
     EmergencyStop,
     TaskStatus,
     TaskWorkItem,
     WorkItemStatus,
 )
-from app.schemas import InferenceRequest, InferenceResponse
+from app.schemas import (
+    AIMessage,
+    AutomationWorkflowStep,
+    InferenceRequest,
+    InferenceResponse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +153,25 @@ def _claim_next_work_item(
             task.status = TaskStatus.FAILED
             task.failure_reason = "Task exceeded the maximum worker attempts"
             task.finished_at = now
+            workflow_run = db.scalar(
+                select(AutomationWorkflowRun)
+                .where(AutomationWorkflowRun.task_id == task.id)
+                .with_for_update()
+            )
+            if workflow_run is not None:
+                workflow_run.status = AutomationWorkflowRunStatus.FAILED
+                workflow_run.failure_reason = task.failure_reason
+                db.add(
+                    AuditEvent(
+                        tenant_id=workflow_run.tenant_id,
+                        actor=worker_id,
+                        action="WORKFLOW_RUN_FAILED",
+                        resource_type="AutomationWorkflowRun",
+                        resource_id=workflow_run.id,
+                        outcome="FAILED",
+                        detail={"reason": "MAX_ATTEMPTS_EXCEEDED"},
+                    )
+                )
             _audit(
                 db,
                 task=task,
@@ -257,6 +283,8 @@ def _execute_ai_inference(
         messages=request.messages,
         temperature=request.temperature,
         max_tokens=request.max_tokens,
+        response_format=request.response_format,
+        tools=request.tools,
     )
     return InferenceResponse(
         model_id=model.id,
@@ -266,7 +294,142 @@ def _execute_ai_inference(
         content=result.content,
         input_tokens=result.input_tokens,
         output_tokens=result.output_tokens,
+        tool_calls=result.tool_calls or [],
+        structured_output=result.structured_output,
     )
+
+
+def _workflow_condition_matches(
+    condition: dict[str, Any] | None,
+    workflow_input: dict[str, Any],
+) -> bool:
+    if condition is None:
+        return True
+    value: Any = workflow_input
+    for segment in condition["path"].split("."):
+        if not isinstance(value, dict) or segment not in value:
+            return False
+        value = value[segment]
+    return value == condition["equals"]
+
+
+def _execute_workflow(
+    db: Session,
+    claim: WorkClaim,
+    provider: InferenceProvider,
+) -> dict[str, Any]:
+    run_id = claim.payload.get("workflow_run_id")
+    if not isinstance(run_id, str):
+        raise PermanentWorkError("Workflow run identifier is invalid")
+    run = db.scalar(
+        select(AutomationWorkflowRun)
+        .where(
+            AutomationWorkflowRun.id == run_id,
+            AutomationWorkflowRun.tenant_id == claim.tenant_id,
+            AutomationWorkflowRun.task_id == claim.task_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if run is None:
+        raise PermanentWorkError("Workflow run was not found")
+    if run.status == AutomationWorkflowRunStatus.CANCELLED:
+        raise PermanentWorkError("Workflow run was cancelled")
+    if run.status == AutomationWorkflowRunStatus.COMPLETED:
+        if run.result_snapshot is None:
+            raise PermanentWorkError("Completed workflow run has no result")
+        return run.result_snapshot
+
+    task = db.scalar(
+        select(ControlTask)
+        .where(ControlTask.id == claim.task_id)
+        .execution_options(populate_existing=True)
+    )
+    if task is None or task.status != TaskStatus.IN_PROGRESS:
+        raise PermanentWorkError("Task is no longer active")
+
+    run.status = AutomationWorkflowRunStatus.IN_PROGRESS
+    run.failure_reason = None
+    db.commit()
+    step_results = list(run.step_results)
+    finished_ids = {
+        step_result["step_id"]
+        for step_result in step_results
+        if step_result["status"] in {"COMPLETED", "SKIPPED"}
+    }
+    workflow_input = run.input
+    input_json = json.dumps(
+        workflow_input,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    execution_claim = WorkClaim(
+        task_id=claim.task_id,
+        tenant_id=claim.tenant_id,
+        work_type="ai.inference",
+        payload={},
+        attempt=claim.attempt,
+    )
+    for step_data in run.steps_snapshot:
+        step = AutomationWorkflowStep.model_validate(step_data)
+        if step.id in finished_ids:
+            continue
+        if not _workflow_condition_matches(
+            step.condition.model_dump(mode="json") if step.condition else None,
+            workflow_input,
+        ):
+            step_results.append(
+                {"step_id": step.id, "status": "SKIPPED", "inference": None}
+            )
+        else:
+            messages = []
+            if step.system_prompt:
+                messages.append(AIMessage(role="system", content=step.system_prompt))
+            messages.append(
+                AIMessage(
+                    role="user",
+                    content=(
+                        f"{step.prompt}\n\nWorkflow input (JSON):\n{input_json}"
+                    ),
+                )
+            )
+            inference = _execute_ai_inference(
+                db,
+                WorkClaim(
+                    task_id=execution_claim.task_id,
+                    tenant_id=execution_claim.tenant_id,
+                    work_type=execution_claim.work_type,
+                    payload=InferenceRequest(
+                        messages=messages,
+                        provider=step.provider,
+                        temperature=step.temperature,
+                        max_tokens=step.max_tokens,
+                        response_format=step.response_format,
+                    ).model_dump(mode="json"),
+                    attempt=execution_claim.attempt,
+                ),
+                provider,
+            )
+            step_results.append(
+                {
+                    "step_id": step.id,
+                    "status": "COMPLETED",
+                    "inference": inference.model_dump(mode="json"),
+                }
+            )
+        run.step_results = step_results
+        db.commit()
+        finished_ids.add(step.id)
+
+    result = {
+        "workflow_id": run.workflow_id,
+        "workflow_version": run.workflow_version,
+        "steps": step_results,
+    }
+    run.result_snapshot = result
+    db.commit()
+    return result
 
 
 def _finish_work_item(
@@ -274,7 +437,7 @@ def _finish_work_item(
     *,
     claim: WorkClaim,
     worker_id: str,
-    result: InferenceResponse | None = None,
+    result: InferenceResponse | dict[str, Any] | None = None,
     error: str | None = None,
     retryable: bool = False,
     now: datetime,
@@ -305,8 +468,33 @@ def _finish_work_item(
     if result is not None:
         work_item.status = WorkItemStatus.COMPLETED
         task.status = TaskStatus.COMPLETED
-        task.result = json.dumps(result.model_dump(mode="json"), ensure_ascii=False)
+        result_value = (
+            result.model_dump(mode="json")
+            if isinstance(result, InferenceResponse)
+            else result
+        )
+        task.result = json.dumps(result_value, ensure_ascii=False)
         task.finished_at = now
+        workflow_run = db.scalar(
+            select(AutomationWorkflowRun)
+            .where(AutomationWorkflowRun.task_id == task.id)
+            .with_for_update()
+        )
+        if workflow_run is not None:
+            workflow_run.status = AutomationWorkflowRunStatus.COMPLETED
+            workflow_run.result_snapshot = result_value
+            workflow_run.failure_reason = None
+            db.add(
+                AuditEvent(
+                    tenant_id=workflow_run.tenant_id,
+                    actor=worker_id,
+                    action="WORKFLOW_RUN_COMPLETED",
+                    resource_type="AutomationWorkflowRun",
+                    resource_id=workflow_run.id,
+                    outcome="SUCCESS",
+                    detail={"step_count": len(result_value.get("steps", []))},
+                )
+            )
         _audit(
             db,
             task=task,
@@ -316,10 +504,16 @@ def _finish_work_item(
             detail={
                 "status": task.status.value,
                 "work_type": claim.work_type,
-                "model_id": result.model_id,
-                "provider": result.provider,
-                "input_tokens": result.input_tokens,
-                "output_tokens": result.output_tokens,
+                **(
+                    {
+                        "model_id": result.model_id,
+                        "provider": result.provider,
+                        "input_tokens": result.input_tokens,
+                        "output_tokens": result.output_tokens,
+                    }
+                    if isinstance(result, InferenceResponse)
+                    else {"step_count": len(result_value.get("steps", []))}
+                ),
             },
         )
     elif retryable and claim.attempt < MAX_ATTEMPTS:
@@ -342,6 +536,25 @@ def _finish_work_item(
         task.status = TaskStatus.FAILED
         task.failure_reason = error or "Task execution failed"
         task.finished_at = now
+        workflow_run = db.scalar(
+            select(AutomationWorkflowRun)
+            .where(AutomationWorkflowRun.task_id == task.id)
+            .with_for_update()
+        )
+        if workflow_run is not None:
+            workflow_run.status = AutomationWorkflowRunStatus.FAILED
+            workflow_run.failure_reason = task.failure_reason
+            db.add(
+                AuditEvent(
+                    tenant_id=workflow_run.tenant_id,
+                    actor=worker_id,
+                    action="WORKFLOW_RUN_FAILED",
+                    resource_type="AutomationWorkflowRun",
+                    resource_id=workflow_run.id,
+                    outcome="FAILED",
+                    detail={"attempt": claim.attempt},
+                )
+            )
         _audit(
             db,
             task=task,
@@ -370,9 +583,12 @@ def process_next_work_item(
 
     active_provider = provider or OpenAICompatibleProvider(settings)
     try:
-        if claim.work_type != "ai.inference":
+        if claim.work_type == "ai.inference":
+            result = _execute_ai_inference(db, claim, active_provider)
+        elif claim.work_type == "automation.workflow":
+            result = _execute_workflow(db, claim, active_provider)
+        else:
             raise PermanentWorkError("Unsupported task work type")
-        result = _execute_ai_inference(db, claim, active_provider)
     except RetryableWorkError:
         _finish_work_item(
             db,

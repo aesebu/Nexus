@@ -51,6 +51,67 @@ def test_openai_compatible_provider_sends_chat_request_and_parses_usage():
     assert result.output_tokens == 3
 
 
+def test_openai_compatible_provider_sends_tools_and_structured_output():
+    received = {}
+    class Dumpable:
+        def __init__(self, value):
+            self.value = value
+        def model_dump(self, **_kwargs):
+            return self.value
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        received["payload"] = json.loads(request.read().decode())
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"answer":"ok"}',
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "lookup",
+                                        "arguments": '{"query":"nexus"}',
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 2},
+            },
+        )
+
+    provider = OpenAICompatibleProvider(
+        Settings(
+            ai_base_url="https://provider.test/v1",
+            ai_api_key=SecretStr("test-secret"),
+        ),
+        transport=httpx.MockTransport(handle),
+    )
+    result = provider.generate(
+        model_identifier="model-x",
+        messages=[AIMessage(role="user", content="question")],
+        temperature=0.2,
+        max_tokens=50,
+        response_format=Dumpable({"type": "json_object"}),
+        tools=[
+            Dumpable({
+                "type": "function",
+                "function": {"name": "lookup", "parameters": {"type": "object"}},
+            })
+        ],
+    )
+
+    assert received["payload"]["response_format"] == {"type": "json_object"}
+    assert received["payload"]["tools"][0]["function"]["name"] == "lookup"
+    assert result.structured_output == {"answer": "ok"}
+    assert result.tool_calls[0]["id"] == "call-1"
+
+
 def test_provider_requires_api_key():
     assert Settings(ai_api_key="").ai_api_key is None
     provider = OpenAICompatibleProvider(Settings(ai_api_key=None))

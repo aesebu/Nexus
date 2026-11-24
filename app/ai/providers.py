@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import json
 from typing import Protocol
 
 import httpx
@@ -36,6 +37,8 @@ class InferenceResult:
     content: str
     input_tokens: int | None
     output_tokens: int | None
+    tool_calls: list[dict] | None = None
+    structured_output: dict | list | None = None
 
 
 class InferenceProvider(Protocol):
@@ -48,6 +51,8 @@ class InferenceProvider(Protocol):
         messages: list[AIMessage],
         temperature: float,
         max_tokens: int,
+        response_format: object | None = None,
+        tools: list[object] | None = None,
     ) -> InferenceResult: ...
 
     def discover_models(self) -> list[str]: ...
@@ -72,6 +77,8 @@ class OpenAICompatibleProvider:
         messages: list[AIMessage],
         temperature: float,
         max_tokens: int,
+        response_format: object | None = None,
+        tools: list[object] | None = None,
     ) -> InferenceResult:
         if self._settings.ai_api_key is None:
             raise ProviderNotConfiguredError("AI provider API key is not configured")
@@ -82,6 +89,12 @@ class OpenAICompatibleProvider:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if response_format is not None:
+            payload["response_format"] = (
+                response_format.model_dump(exclude_none=True)
+            )
+        if tools:
+            payload["tools"] = [tool.model_dump(exclude_none=True) for tool in tools]
         try:
             with httpx.Client(
                 timeout=30.0,
@@ -110,12 +123,31 @@ class OpenAICompatibleProvider:
         try:
             body = response.json()
             message = body["choices"][0]["message"]
-            content = message["content"]
+            content = message.get("content")
+            raw_tool_calls = message.get("tool_calls")
+            tool_calls = raw_tool_calls if isinstance(raw_tool_calls, list) else []
             usage = body.get("usage", {})
             input_tokens = usage.get("prompt_tokens")
             output_tokens = usage.get("completion_tokens")
+            if content is None:
+                content = ""
             if not isinstance(content, str):
                 raise TypeError("response content is not a string")
+            if not isinstance(tool_calls, list):
+                raise TypeError("tool calls are not a list")
+            structured_output = None
+            if response_format is not None:
+                try:
+                    parsed = json.loads(content)
+                except json.JSONDecodeError as exc:
+                    raise ProviderResponseError(
+                        "AI provider returned invalid structured output"
+                    ) from exc
+                if not isinstance(parsed, (dict, list)):
+                    raise ProviderResponseError(
+                        "AI provider returned invalid structured output"
+                    )
+                structured_output = parsed
             if input_tokens is not None and (
                 not isinstance(input_tokens, int) or isinstance(input_tokens, bool)
             ):
@@ -131,6 +163,8 @@ class OpenAICompatibleProvider:
             content=content,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            tool_calls=tool_calls,
+            structured_output=structured_output,
         )
 
     def discover_models(self) -> list[str]:
