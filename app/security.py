@@ -32,6 +32,7 @@ ROLE_PERMISSIONS = {
         "nexus.model.update",
         "nexus.model.route",
         "nexus.ai.infer",
+        "nexus.ai.evaluation.read",
         "nexus.agent.read",
         "nexus.agent.manage",
         "nexus.agent.run",

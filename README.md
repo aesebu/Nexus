@@ -92,7 +92,7 @@ Deployment: supports **Local, Cloud, and Hybrid**, with a Control Plane / Execut
 | 10 | NEXUS System | Operational Ecosystem | Complete (MVP) |
 | 11 | Integration | Integrated Platform | Complete (MVP) |
 | 12 | Production | Production Release | Complete (MVP) |
-| 13 | Evolution | Continuous Improvement | Planned |
+| 13 | Evolution | Continuous Improvement | Complete (MVP) |
 
 ## Repository Contents
 
@@ -104,6 +104,7 @@ Deployment: supports **Local, Cloud, and Hybrid**, with a Control Plane / Execut
 | [`docs/PHASE_00_PROJECT_FOUNDATION.md`](docs/PHASE_00_PROJECT_FOUNDATION.md) | Phase 00 specification, implementation, acceptance criteria, and test evidence |
 | [`docs/PHASE_01_SUPREME_ARCHITECTURE.md`](docs/PHASE_01_SUPREME_ARCHITECTURE.md) | Phase 01 three-tier architecture, boundaries, flows, deployment, and acceptance criteria |
 | [`docs/PHASE_02_AUTHORITY_AND_GOVERNANCE.md`](docs/PHASE_02_AUTHORITY_AND_GOVERNANCE.md) | Phase 02 authority model, governance decisions, audit evidence, and acceptance criteria |
+| [`docs/PHASE_03_CORE_FOUNDATION.md`](docs/PHASE_03_CORE_FOUNDATION.md) | Phase 03 central control scope, system/task/event/configuration boundaries, and test evidence |
 | [`docs/PHASE_05_AI_ENGINE.md`](docs/PHASE_05_AI_ENGINE.md) | Phase 05 AI Engine specification, implementation, boundaries, and acceptance criteria |
 | [`docs/PHASE_06_AGENT_ENGINE.md`](docs/PHASE_06_AGENT_ENGINE.md) | Phase 06 agent registry, lifecycle, orchestration, security boundaries, and acceptance criteria |
 | [`docs/AGENT_ENGINE.md`](docs/AGENT_ENGINE.md) | Agent Engine API and operations guide |
@@ -118,6 +119,7 @@ Deployment: supports **Local, Cloud, and Hybrid**, with a Control Plane / Execut
 | [`docs/PHASE_11_INTEGRATION.md`](docs/PHASE_11_INTEGRATION.md) | Phase 11 signed outbound webhook scope, delivery semantics, security boundaries, and acceptance criteria |
 | [`docs/INTEGRATIONS.md`](docs/INTEGRATIONS.md) | Outbound webhook setup, signature verification, retries, and operations |
 | [`docs/PHASE_12_PRODUCTION_RELEASE.md`](docs/PHASE_12_PRODUCTION_RELEASE.md) | Phase 12 production deployment scope, release checks, and operational boundaries |
+| [`docs/PHASE_13_EVOLUTION.md`](docs/PHASE_13_EVOLUTION.md) | Phase 13 human feedback and tenant-scoped AI evaluation signals |
 | [`examples/nexus-api.http`](examples/nexus-api.http) | Sample model registry and inference requests |
 | [`examples/seed_models.json`](examples/seed_models.json) | Disabled placeholder models for optional development seeding |
 
@@ -159,6 +161,7 @@ The initial implementation provides:
 - Tenant-scoped, versioned AI inference workflows with delayed runs and resumable worker execution
 - Tenant-scoped application registry with lifecycle and declared permission/data scopes
 - Signed outbound webhook delivery from tenant event subscriptions with allowlisted HTTPS destinations
+- Human ratings for persisted AI responses with owner-only tenant/model aggregates
 - Opt-in development model seed data
 - Docker and Docker Compose configuration
 - Pytest API coverage

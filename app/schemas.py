@@ -713,8 +713,34 @@ class InferenceResponse(BaseModel):
     input_tokens: int | None
     output_tokens: int | None
     conversation_id: str | None = None
+    response_message_id: str | None = None
     tool_calls: list[AIToolCall] = Field(default_factory=list)
     structured_output: dict[str, Any] | list[Any] | None = None
+
+
+class AIResponseFeedbackRequest(BaseModel):
+    rating: int = Field(ge=1, le=5)
+
+
+class AIResponseFeedbackResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    tenant_id: str
+    message_id: str
+    model_id: str | None
+    submitted_by: str
+    rating: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class AIModelEvaluationSummary(BaseModel):
+    model_id: str | None
+    model_name: str | None
+    provider: str | None
+    feedback_count: int
+    average_rating: float
 
 
 class AIConversationCreate(BaseModel):

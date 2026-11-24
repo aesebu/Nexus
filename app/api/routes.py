@@ -27,6 +27,7 @@ from app.models import (
     AIModelStatus,
     AIConversation,
     AIConversationMessage,
+    AIResponseFeedback,
     AIAgent,
     AgentStatus,
     KnowledgeChunk,
@@ -121,6 +122,9 @@ from app.schemas import (
     EventResponse,
     InferenceRequest,
     InferenceResponse,
+    AIResponseFeedbackRequest,
+    AIResponseFeedbackResponse,
+    AIModelEvaluationSummary,
     ModelRouteRequest,
     ModelRouteResponse,
     NexusChatRequest,
@@ -2334,6 +2338,7 @@ def _run_inference(
         },
     )
     conversation_id = request.conversation_id
+    response_message_id = None
     if conversation_id is not None:
         conversation = db.scalar(
             select(AIConversation).where(
@@ -2364,15 +2369,17 @@ def _run_inference(
                 for offset, message in enumerate(request_messages)
                 if message.role in {"user", "assistant"}
             )
-            db.add(
-                AIConversationMessage(
-                    conversation_id=conversation.id,
-                    tenant_id=tenant_id,
-                    sequence=next_sequence + len(request_messages),
-                    role="assistant",
-                    content=result.content,
-                )
+            assistant_message = AIConversationMessage(
+                conversation_id=conversation.id,
+                tenant_id=tenant_id,
+                sequence=next_sequence + len(request_messages),
+                role="assistant",
+                content=result.content,
+                model_id=model.id,
             )
+            db.add(assistant_message)
+            db.flush()
+            response_message_id = assistant_message.id
             conversation.updated_at = utcnow()
     db.commit()
     return InferenceResponse(
@@ -2384,9 +2391,119 @@ def _run_inference(
         input_tokens=result.input_tokens,
         output_tokens=result.output_tokens,
         conversation_id=conversation_id,
+        response_message_id=response_message_id,
         tool_calls=result.tool_calls or [],
         structured_output=result.structured_output,
     )
+
+
+@router.put(
+    "/ai/messages/{message_id}/feedback",
+    response_model=AIResponseFeedbackResponse,
+)
+def upsert_ai_response_feedback(
+    message_id: str,
+    request: AIResponseFeedbackRequest,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.ai.infer")),
+) -> AIResponseFeedback:
+    actor, tenant_id = identity
+    message = db.scalar(
+        select(AIConversationMessage)
+        .join(AIConversation, AIConversation.id == AIConversationMessage.conversation_id)
+        .where(
+            AIConversationMessage.id == message_id,
+            AIConversationMessage.tenant_id == tenant_id,
+            AIConversationMessage.role == "assistant",
+            AIConversation.tenant_id == tenant_id,
+            AIConversation.created_by == actor,
+        )
+        .with_for_update()
+    )
+    if message is None:
+        raise HTTPException(status_code=404, detail="Assistant response not found")
+
+    feedback = db.scalar(
+        select(AIResponseFeedback)
+        .where(
+            AIResponseFeedback.tenant_id == tenant_id,
+            AIResponseFeedback.message_id == message_id,
+            AIResponseFeedback.submitted_by == actor,
+        )
+        .with_for_update()
+    )
+    action = "AI_RESPONSE_FEEDBACK_UPDATED"
+    if feedback is None:
+        action = "AI_RESPONSE_FEEDBACK_SUBMITTED"
+        feedback = AIResponseFeedback(
+            tenant_id=tenant_id,
+            message_id=message_id,
+            model_id=message.model_id,
+            submitted_by=actor,
+            rating=request.rating,
+        )
+        db.add(feedback)
+    else:
+        feedback.rating = request.rating
+
+    audit(
+        db,
+        tenant_id=tenant_id,
+        actor=actor,
+        action=action,
+        resource_type="AIResponseFeedback",
+        resource_id=feedback.id,
+        outcome="SUCCESS",
+        detail={"model_id": feedback.model_id},
+    )
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Feedback changed concurrently; retry the request",
+        ) from exc
+    db.refresh(feedback)
+    return feedback
+
+
+@router.get(
+    "/ai/evaluations/summary",
+    response_model=list[AIModelEvaluationSummary],
+)
+def list_ai_evaluation_summary(
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.ai.evaluation.read")),
+) -> list[AIModelEvaluationSummary]:
+    _, tenant_id = identity
+    rows = db.execute(
+        select(
+            AIResponseFeedback.model_id,
+            AIModel.name.label("model_name"),
+            AIModel.provider,
+            func.count(AIResponseFeedback.id).label("feedback_count"),
+            func.avg(AIResponseFeedback.rating).label("average_rating"),
+        )
+        .outerjoin(AIModel, AIModel.id == AIResponseFeedback.model_id)
+        .where(AIResponseFeedback.tenant_id == tenant_id)
+        .group_by(
+            AIResponseFeedback.model_id,
+            AIModel.name,
+            AIModel.provider,
+        )
+        .order_by(AIResponseFeedback.model_id.asc())
+    ).all()
+    return [
+        AIModelEvaluationSummary(
+            model_id=row.model_id,
+            model_name=row.model_name,
+            provider=row.provider,
+            feedback_count=row.feedback_count,
+            average_rating=round(float(row.average_rating), 2),
+        )
+        for row in rows
+    ]
 
 
 @router.post("/nexus/chat", response_model=InferenceResponse)

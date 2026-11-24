@@ -295,8 +295,8 @@ Security and governance system.
 | Core Module | Implemented in MVP | Outstanding |
 |---|---|---|
 | CORE-01: Control Engine | Command lifecycle, system registry, manual task lifecycle, durable AI inference/workflow/webhook worker queue, event journal with signed webhook dispatch, tenant configuration store | Event broker and richer routing, runtime health monitoring, live configuration application |
-| CORE-02: AI Engine | OpenAI-compatible inference, persistent tenant/actor-scoped conversations, structured output, and tool-call declarations | Response evaluation, additional provider adapters |
-| CORE-03: Model Intelligence | Tenant-scoped model registry and deterministic capability routing | Model discovery, evaluation, monitoring, additional provider adapters |
+| CORE-02: AI Engine | OpenAI-compatible inference, persistent tenant/actor-scoped conversations, structured output, tool-call declarations, and human ratings for persisted responses | Automated response evaluation, additional provider adapters |
+| CORE-03: Model Intelligence | Tenant-scoped model registry, deterministic capability routing, and tenant-scoped model feedback aggregates | Model discovery, automated evaluation, monitoring, additional provider adapters |
 | CORE-04: Agent Engine | Tenant-scoped agent registry, lifecycle, explicit invocation, and ordered multi-agent orchestration | Autonomous scheduling, tool execution, agent messaging, and delegated permissions |
 | CORE-05: Memory & Knowledge Engine | Tenant-scoped versioned document repository, deterministic lexical chunk retrieval, and a tenant-scoped source registry with credibility, license, access, verification, and lifecycle metadata | Embeddings, semantic/vector retrieval, automatic RAG, knowledge graph, evidence provenance, personal memory |
 | CORE-06: Intelligence Engine | Persisted deterministic weighted decision assessments and separate 5x5 risk analysis | AI recommendations, predictive modeling, dataset pattern analysis, automated decisions |
@@ -512,7 +512,7 @@ The system must provide:
 | 10 | NEXUS System | Operational Ecosystem | Complete (MVP) |
 | 11 | Integration | Integrated Platform | Complete (MVP) |
 | 12 | Production | Production Release | Complete (MVP) |
-| 13 | Evolution | Continuous Improvement | Planned |
+| 13 | Evolution | Continuous Improvement | Complete (MVP) |
 
 Every Phase must include Specification, Implementation, Testing, and Acceptance Criteria.
 

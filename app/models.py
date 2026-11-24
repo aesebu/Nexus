@@ -2,7 +2,16 @@ import enum
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, Enum, ForeignKey, String, Text, DateTime, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    CheckConstraint,
+    Enum,
+    ForeignKey,
+    String,
+    Text,
+    DateTime,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -451,7 +460,47 @@ class AIConversationMessage(Base):
     sequence: Mapped[int] = mapped_column()
     role: Mapped[str] = mapped_column(String(32))
     content: Mapped[str] = mapped_column(Text)
+    model_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "ai_models.id",
+            ondelete="SET NULL",
+            name="fk_ai_conversation_messages_model_id_ai_models",
+        ),
+        nullable=True,
+        index=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AIResponseFeedback(Base):
+    __tablename__ = "ai_response_feedback"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "message_id",
+            "submitted_by",
+            name="uq_ai_response_feedback_actor_message",
+        ),
+        CheckConstraint(
+            "rating >= 1 AND rating <= 5",
+            name="ck_ai_response_feedback_rating",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    message_id: Mapped[str] = mapped_column(
+        ForeignKey("ai_conversation_messages.id", ondelete="CASCADE"), index=True
+    )
+    model_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ai_models.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    submitted_by: Mapped[str] = mapped_column(String(128))
+    rating: Mapped[int] = mapped_column()
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
 
 
 class AIAgent(Base):

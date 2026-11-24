@@ -110,6 +110,26 @@ and `DELETE /api/v1/ai/conversations/{conversation_id}` to remove it.
 Prompts and responses are stored in conversation history. This is user data:
 operators must apply database access controls and retention procedures.
 
+## Human response feedback
+
+When inference uses a persistent conversation, the response includes
+`response_message_id`. The conversation creator can submit or update a rating
+for that assistant response:
+
+```http
+PUT /api/v1/ai/messages/{response_message_id}/feedback
+Content-Type: application/json
+
+{"rating": 4}
+```
+
+Ratings are integers from 1 to 5. Each actor has one current rating per
+response. No free-text feedback is collected. Only tenant owners can read
+`GET /api/v1/ai/evaluations/summary`, which reports rating count and average
+grouped by model; it does not return prompts or responses. Older conversation
+messages without model attribution are included in an unassigned group.
+Feedback is for human review and does not train models or change routing.
+
 ## Structured output and tools
 
 An inference request may include `response_format` for JSON output:
