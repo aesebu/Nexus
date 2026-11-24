@@ -18,16 +18,22 @@ from pydantic import (
 from app.models import (
     AIModelHealthStatus,
     AIModelStatus,
+    ApplicationStatus,
     AgentStatus,
     AutomationWorkflowRunStatus,
     AutomationWorkflowStatus,
     KnowledgeDocumentStatus,
     KnowledgeSourceCredibility,
     KnowledgeSourceStatus,
+    IntegrationWebhookStatus,
     CommandStatus,
     RegistryStatus,
     TaskStatus,
 )
+from app.security import ROLE_PERMISSIONS
+
+
+_KNOWN_APPLICATION_PERMISSION_SCOPES = set().union(*ROLE_PERMISSIONS.values())
 
 
 class CommandCreate(BaseModel):
@@ -172,6 +178,116 @@ class SystemRegistrationResponse(BaseModel):
     updated_at: datetime
 
 
+class ApplicationRegistrationCreate(BaseModel):
+    app_key: str = Field(
+        min_length=2,
+        max_length=64,
+        pattern=r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+    )
+    name: str = Field(min_length=1, max_length=128)
+    description: str | None = Field(default=None, max_length=500)
+    status: ApplicationStatus = ApplicationStatus.REGISTERED
+    permission_scopes: list[str] = Field(default_factory=list, max_length=64)
+    data_scopes: list[str] = Field(default_factory=list, max_length=64)
+
+    @field_validator("permission_scopes")
+    @classmethod
+    def validate_permission_scopes(cls, value: list[str]) -> list[str]:
+        _validate_application_permission_scopes(value)
+        return value
+
+    @field_validator("data_scopes")
+    @classmethod
+    def validate_data_scopes(cls, value: list[str]) -> list[str]:
+        _validate_application_data_scopes(value)
+        return value
+
+
+class ApplicationRegistrationUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    description: str | None = Field(default=None, max_length=500)
+    status: ApplicationStatus | None = None
+    permission_scopes: list[str] | None = Field(default=None, max_length=64)
+    data_scopes: list[str] | None = Field(default=None, max_length=64)
+
+    @field_validator(
+        "name",
+        "status",
+        "permission_scopes",
+        "data_scopes",
+        mode="before",
+    )
+    @classmethod
+    def reject_null_application_fields(cls, value: Any) -> Any:
+        if value is None:
+            raise ValueError("Application fields cannot be null")
+        return value
+
+    @field_validator("permission_scopes")
+    @classmethod
+    def validate_permission_scopes(
+        cls,
+        value: list[str] | None,
+    ) -> list[str] | None:
+        if value is not None:
+            _validate_application_permission_scopes(value)
+        return value
+
+    @field_validator("data_scopes")
+    @classmethod
+    def validate_data_scopes(cls, value: list[str] | None) -> list[str] | None:
+        if value is not None:
+            _validate_application_data_scopes(value)
+        return value
+
+    @model_validator(mode="after")
+    def requires_update_field(self) -> "ApplicationRegistrationUpdate":
+        if not self.model_fields_set:
+            raise ValueError("At least one application field must be provided")
+        return self
+
+
+def _validate_application_permission_scopes(value: list[str]) -> None:
+    if len(set(value)) != len(value):
+        raise ValueError("Application permission scopes must be unique")
+    unknown_scopes = set(value) - _KNOWN_APPLICATION_PERMISSION_SCOPES
+    if unknown_scopes:
+        raise ValueError(
+            "Application permission scopes must match known NEXUS permissions"
+        )
+
+
+def _validate_application_data_scopes(value: list[str]) -> None:
+    if len(set(value)) != len(value):
+        raise ValueError("Application data scopes must be unique")
+    for scope in value:
+        if (
+            len(scope) > 128
+            or re.fullmatch(
+                r"[a-z][a-z0-9]*(?:[._:-][a-z0-9]+)*",
+                scope,
+            )
+            is None
+        ):
+            raise ValueError("Application data scopes must be valid scope identifiers")
+
+
+class ApplicationRegistrationResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    tenant_id: str
+    app_key: str
+    name: str
+    description: str | None
+    status: ApplicationStatus
+    permission_scopes: list[str]
+    data_scopes: list[str]
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
+
+
 class TaskComplete(BaseModel):
     result: str | None = Field(default=None, max_length=10_000)
 
@@ -241,7 +357,12 @@ class EventCreate(BaseModel):
     def limit_event_payload_size(cls, value: dict[str, Any]) -> dict[str, Any]:
         try:
             serialized_size = len(
-                json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+                json.dumps(
+                    value,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
             )
         except (TypeError, ValueError) as exc:
             raise ValueError("Event payload must contain JSON-compatible data") from exc
@@ -260,6 +381,102 @@ class EventResponse(BaseModel):
     payload: dict[str, Any]
     published_by: str
     created_at: datetime
+
+
+class IntegrationWebhookCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    target_url: str = Field(min_length=8, max_length=2048)
+    secret_name: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+    )
+    event_types: list[str] = Field(min_length=1, max_length=64)
+    status: IntegrationWebhookStatus = IntegrationWebhookStatus.REGISTERED
+
+    @field_validator("event_types")
+    @classmethod
+    def validate_event_types(cls, value: list[str]) -> list[str]:
+        _validate_webhook_event_types(value)
+        return value
+
+
+class IntegrationWebhookUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    target_url: str | None = Field(default=None, min_length=8, max_length=2048)
+    secret_name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+    )
+    event_types: list[str] | None = Field(default=None, min_length=1, max_length=64)
+    status: IntegrationWebhookStatus | None = None
+
+    @field_validator(
+        "name",
+        "target_url",
+        "secret_name",
+        "event_types",
+        "status",
+        mode="before",
+    )
+    @classmethod
+    def reject_null_webhook_fields(cls, value: Any) -> Any:
+        if value is None:
+            raise ValueError("Webhook fields cannot be null")
+        return value
+
+    @field_validator("event_types")
+    @classmethod
+    def validate_event_types(
+        cls,
+        value: list[str] | None,
+    ) -> list[str] | None:
+        if value is not None:
+            _validate_webhook_event_types(value)
+        return value
+
+    @model_validator(mode="after")
+    def requires_update_field(self) -> "IntegrationWebhookUpdate":
+        if not self.model_fields_set:
+            raise ValueError("At least one webhook field must be provided")
+        return self
+
+
+def _validate_webhook_event_types(value: list[str]) -> None:
+    if len(set(value)) != len(value):
+        raise ValueError("Webhook event types must be unique")
+    for event_type in value:
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", event_type) is None:
+            raise ValueError("Webhook event types must be valid event identifiers")
+
+
+class IntegrationWebhookResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    tenant_id: str
+    name: str
+    target_url: str
+    secret_name: str
+    event_types: list[str]
+    status: IntegrationWebhookStatus
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class IntegrationWebhookDeliveryResponse(BaseModel):
+    id: str
+    webhook_id: str
+    event_id: str
+    task_id: str
+    status: TaskStatus
+    attempts: int
+    failure_reason: str | None
+    created_at: datetime
+    finished_at: datetime | None
 
 
 class ConfigurationUpsert(BaseModel):

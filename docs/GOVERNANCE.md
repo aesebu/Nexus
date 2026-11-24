@@ -101,6 +101,8 @@ secrets platform.
 This MVP selects policy by exact command type and can require approval when
 explicitly configured payload keys are present. It does not evaluate payload
 values, autonomy levels, resource limits, or risk scores. Risk scoring, secret
-key rotation, external KMS integration, and production database migrations are
-outstanding roadmap work. Do not treat this policy slice as a complete
-production governance system.
+key rotation, external KMS integration, and advanced governance controls are
+outstanding roadmap work. The production MVP applies schema changes through a
+one-shot deployment migration job, but this does not provide migration review
+or a separate runtime database role. Do not treat this policy slice as a
+complete production governance system.

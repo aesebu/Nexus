@@ -89,9 +89,9 @@ Deployment: supports **Local, Cloud, and Hybrid**, with a Control Plane / Execut
 | 07 | Memory & Knowledge | Knowledge Repository and Source Registry | Complete (MVP) |
 | 08 | Intelligence Engine | Reasoning & Decision Support | Complete (MVP) |
 | 09 | Automation | Workflow Engine | Complete (MVP) |
-| 10 | NEXUS System | Operational Ecosystem | Planned |
-| 11 | Integration | Integrated Platform | Planned |
-| 12 | Production | Production Release | Planned |
+| 10 | NEXUS System | Operational Ecosystem | Complete (MVP) |
+| 11 | Integration | Integrated Platform | Complete (MVP) |
+| 12 | Production | Production Release | Complete (MVP) |
 | 13 | Evolution | Continuous Improvement | Planned |
 
 ## Repository Contents
@@ -113,6 +113,11 @@ Deployment: supports **Local, Cloud, and Hybrid**, with a Control Plane / Execut
 | [`docs/INTELLIGENCE_ENGINE.md`](docs/INTELLIGENCE_ENGINE.md) | Intelligence Engine API and operations guide |
 | [`docs/PHASE_09_AUTOMATION_WORKFLOWS.md`](docs/PHASE_09_AUTOMATION_WORKFLOWS.md) | Phase 09 automation workflow scope, execution semantics, boundaries, and acceptance criteria |
 | [`docs/AUTOMATION_WORKFLOWS.md`](docs/AUTOMATION_WORKFLOWS.md) | Automation workflow API and operations guide |
+| [`docs/PHASE_10_OPERATIONAL_ECOSYSTEM.md`](docs/PHASE_10_OPERATIONAL_ECOSYSTEM.md) | Phase 10 tenant application registry scope, security boundaries, and acceptance criteria |
+| [`docs/APPLICATION_ECOSYSTEM.md`](docs/APPLICATION_ECOSYSTEM.md) | Application registry API and authorization boundary |
+| [`docs/PHASE_11_INTEGRATION.md`](docs/PHASE_11_INTEGRATION.md) | Phase 11 signed outbound webhook scope, delivery semantics, security boundaries, and acceptance criteria |
+| [`docs/INTEGRATIONS.md`](docs/INTEGRATIONS.md) | Outbound webhook setup, signature verification, retries, and operations |
+| [`docs/PHASE_12_PRODUCTION_RELEASE.md`](docs/PHASE_12_PRODUCTION_RELEASE.md) | Phase 12 production deployment scope, release checks, and operational boundaries |
 | [`examples/nexus-api.http`](examples/nexus-api.http) | Sample model registry and inference requests |
 | [`examples/seed_models.json`](examples/seed_models.json) | Disabled placeholder models for optional development seeding |
 
@@ -152,6 +157,8 @@ The initial implementation provides:
 - Tenant-scoped knowledge source registry with credibility, license, access, verification, and lifecycle metadata
 - Deterministic, tenant-scoped weighted decision assessments with separate risk analysis
 - Tenant-scoped, versioned AI inference workflows with delayed runs and resumable worker execution
+- Tenant-scoped application registry with lifecycle and declared permission/data scopes
+- Signed outbound webhook delivery from tenant event subscriptions with allowlisted HTTPS destinations
 - Opt-in development model seed data
 - Docker and Docker Compose configuration
 - Pytest API coverage
@@ -167,6 +174,10 @@ Production deployments must set:
 - `NEXUS_JWT_AUDIENCE`
 - `NEXUS_SECRET_ENCRYPTION_KEY`
 
+For outbound webhooks, configure `NEXUS_INTEGRATION_ALLOWED_HOSTS` as a
+comma-separated list of exact HTTPS destination hostnames. Docker Compose
+passes this value to both the API and worker.
+
 The application refuses to start in production when the JWT configuration is
 missing or uses the development JWT secret. Production JWTs must include
 `exp`, `iss`, and `aud`. Docker Compose requires `POSTGRES_PASSWORD` and
@@ -179,7 +190,8 @@ alembic upgrade head
 alembic downgrade base
 ```
 
-The API container and worker both apply migrations before startup. The legacy
+Docker Compose runs a one-shot migration service after PostgreSQL is healthy,
+then starts the API and worker only if migrations succeed. The legacy
 development startup path may create missing SQLite tables, but production
 startup does not use `create_all()`.
 
@@ -187,18 +199,19 @@ Use `/health/live` for process liveness and `/health/ready` for database
 readiness. `/health` remains available as a compatibility endpoint.
 
 Manual tasks continue to use the task lifecycle endpoints. Tasks created with
-`work_type: "ai.inference"` and active automation workflow runs are claimed by
-the separate worker process and routed to enabled chat models for the same
-tenant. Configure an enabled chat model and `NEXUS_AI_API_KEY` before
-submitting inference work. The worker uses database leases and retries
-transient provider failures up to three attempts; processing is at-least-once,
-so a provider timeout can cause a repeated request. Workflow runs snapshot
-their definition and persist each completed step to resume after retries.
-Emergency stop prevents new tasks from being claimed. Inference prompts,
-workflow inputs, and results are stored unencrypted in the application
-database; results are visible through tenant-scoped reads, so do not include
-secret values. The event journal
-stores and filters events but does not dispatch them through a broker. Tenant
+`work_type: "ai.inference"`, active automation workflow runs, and webhook
+deliveries are claimed by the separate worker process. Configure an enabled
+chat model and `NEXUS_AI_API_KEY` before submitting inference work. Webhook
+delivery requires an allowlisted hostname and a signing secret in the tenant
+secret store. The worker uses database leases and retries transient failures
+up to three attempts; processing is at-least-once, so a provider timeout can
+cause a repeated request. Workflow runs snapshot their definition and persist
+each completed step to resume after retries. Emergency stop prevents new tasks
+from being claimed. Inference prompts, workflow inputs, and results are stored
+unencrypted in the application database; results are visible through
+tenant-scoped reads, so do not include secret values. The event journal stores
+and filters events, then queues matching webhook deliveries through the worker
+without using a separate event broker. Tenant
 configuration values are stored for management but are not automatically
 applied to runtime settings; this store is not for credentials or other
 secrets. Secret writes require
@@ -222,7 +235,10 @@ For local background execution, run the worker in a second terminal:
 python -m app.worker
 ```
 
-Docker Compose starts the worker alongside the API. To enqueue an inference task, post a task with `work_type: "ai.inference"` and
+Docker Compose runs a one-shot migration service after PostgreSQL is healthy,
+then starts the API and worker only if migrations succeed. Application
+containers run as an unprivileged user. Place the API behind a TLS-terminating
+reverse proxy for external access. To enqueue an inference task, post a task with `work_type: "ai.inference"` and
 `work_payload` matching the `/api/v1/ai/infer` request body. For workflows,
 create and activate one through `/api/v1/workflows`, then queue a run through
 `/api/v1/workflows/{workflow_id}/runs`.

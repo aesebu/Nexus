@@ -294,21 +294,28 @@ Security and governance system.
 
 | Core Module | Implemented in MVP | Outstanding |
 |---|---|---|
-| CORE-01: Control Engine | Command lifecycle, system registry, manual task lifecycle, durable AI inference worker queue, event journal, tenant configuration store | Additional task handlers, event broker/dispatch, runtime health monitoring, live configuration application |
+| CORE-01: Control Engine | Command lifecycle, system registry, manual task lifecycle, durable AI inference/workflow/webhook worker queue, event journal with signed webhook dispatch, tenant configuration store | Event broker and richer routing, runtime health monitoring, live configuration application |
 | CORE-02: AI Engine | OpenAI-compatible inference, persistent tenant/actor-scoped conversations, structured output, and tool-call declarations | Response evaluation, additional provider adapters |
 | CORE-03: Model Intelligence | Tenant-scoped model registry and deterministic capability routing | Model discovery, evaluation, monitoring, additional provider adapters |
 | CORE-04: Agent Engine | Tenant-scoped agent registry, lifecycle, explicit invocation, and ordered multi-agent orchestration | Autonomous scheduling, tool execution, agent messaging, and delegated permissions |
 | CORE-05: Memory & Knowledge Engine | Tenant-scoped versioned document repository, deterministic lexical chunk retrieval, and a tenant-scoped source registry with credibility, license, access, verification, and lifecycle metadata | Embeddings, semantic/vector retrieval, automatic RAG, knowledge graph, evidence provenance, personal memory |
 | CORE-06: Intelligence Engine | Persisted deterministic weighted decision assessments and separate 5x5 risk analysis | AI recommendations, predictive modeling, dataset pattern analysis, automated decisions |
 | CORE-07: Automation Engine | Tenant-scoped versioned workflows with ordered AI inference steps, input conditions, delayed runs, and resumable worker execution | Recurring/event triggers, arbitrary code, graph branching, parallel execution, automatic agent/tool orchestration |
+| Application Ecosystem | Tenant-scoped application registry with lifecycle and declared permission/data scopes | Application credentials, app-specific identity, token issuance, runtime scope enforcement |
 | CORE-09: Security & Governance | Tenant RBAC, fail-closed command policies, immutable policy version history, payload-key approval rules, approval separation, audit, emergency stop, encrypted tenant secret store | Risk scoring, key rotation, external KMS |
 
 Registry status is administrative metadata and does not prove runtime health.
-The task worker executes queued AI inference and workflow work with
+Application profiles and declared scopes are metadata only; they do not
+authenticate applications or grant/enforce permissions.
+External event delivery is limited to signed outbound HTTPS webhooks whose
+hostnames are deployment-allowlisted; inbound hooks and broker delivery remain
+outstanding.
+The task worker executes queued AI inference, workflow, and webhook work with
 database-backed leases; manual tasks still use lifecycle endpoints. Workflow
 runs snapshot their definitions and persist completed steps, while provider
-timeouts remain at-least-once. The event journal stores and filters events but
-does not dispatch them. Tenant configuration is stored for
+timeouts remain at-least-once. The event journal stores and filters events,
+then queues matching webhook subscriptions for signed delivery without a
+separate event broker. Tenant configuration is stored for
 management only and is not a secret store or a live runtime configuration
 source. Secret values are encrypted with an externally supplied application
 key and are not returned by the HTTP API; key rotation and external KMS
@@ -502,9 +509,9 @@ The system must provide:
 | 07 | Memory & Knowledge | Knowledge Repository and Source Registry | Complete (MVP) |
 | 08 | Intelligence Engine | Reasoning & Decision Support | Complete (MVP) |
 | 09 | Automation | Workflow Engine | Complete (MVP) |
-| 10 | NEXUS System | Operational Ecosystem | Planned |
-| 11 | Integration | Integrated Platform | Planned |
-| 12 | Production | Production Release | Planned |
+| 10 | NEXUS System | Operational Ecosystem | Complete (MVP) |
+| 11 | Integration | Integrated Platform | Complete (MVP) |
+| 12 | Production | Production Release | Complete (MVP) |
 | 13 | Evolution | Continuous Improvement | Planned |
 
 Every Phase must include Specification, Implementation, Testing, and Acceptance Criteria.

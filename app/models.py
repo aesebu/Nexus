@@ -43,6 +43,12 @@ class RegistryStatus(str, enum.Enum):
     DISABLED = "DISABLED"
 
 
+class ApplicationStatus(str, enum.Enum):
+    REGISTERED = "REGISTERED"
+    ENABLED = "ENABLED"
+    DISABLED = "DISABLED"
+
+
 class AgentStatus(str, enum.Enum):
     REGISTERED = "REGISTERED"
     ENABLED = "ENABLED"
@@ -84,6 +90,12 @@ class WorkItemStatus(str, enum.Enum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+
+
+class IntegrationWebhookStatus(str, enum.Enum):
+    REGISTERED = "REGISTERED"
+    ENABLED = "ENABLED"
+    DISABLED = "DISABLED"
 
 
 class Command(Base):
@@ -178,6 +190,35 @@ class SystemRegistration(Base):
     )
 
 
+class ApplicationRegistration(Base):
+    __tablename__ = "application_registry"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "app_key",
+            name="uq_application_registry_tenant_key",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    app_key: Mapped[str] = mapped_column(String(64))
+    name: Mapped[str] = mapped_column(String(128))
+    description: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    status: Mapped[ApplicationStatus] = mapped_column(
+        Enum(ApplicationStatus),
+        default=ApplicationStatus.REGISTERED,
+        index=True,
+    )
+    permission_scopes: Mapped[list[str]] = mapped_column(JSON, default=list)
+    data_scopes: Mapped[list[str]] = mapped_column(JSON, default=list)
+    created_by: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
 class ControlTask(Base):
     __tablename__ = "control_tasks"
 
@@ -231,6 +272,62 @@ class ControlEvent(Base):
     source_system_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
     published_by: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class IntegrationWebhook(Base):
+    __tablename__ = "integration_webhooks"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "name",
+            name="uq_integration_webhook_tenant_name",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    name: Mapped[str] = mapped_column(String(128))
+    target_url: Mapped[str] = mapped_column(String(2048))
+    secret_name: Mapped[str] = mapped_column(String(128))
+    event_types: Mapped[list[str]] = mapped_column(JSON, default=list)
+    status: Mapped[IntegrationWebhookStatus] = mapped_column(
+        Enum(IntegrationWebhookStatus),
+        default=IntegrationWebhookStatus.REGISTERED,
+        index=True,
+    )
+    created_by: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class IntegrationWebhookDelivery(Base):
+    __tablename__ = "integration_webhook_deliveries"
+    __table_args__ = (
+        UniqueConstraint(
+            "webhook_id",
+            "event_id",
+            name="uq_integration_webhook_delivery_event",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("control_tasks.id", ondelete="CASCADE"),
+        unique=True,
+        index=True,
+    )
+    webhook_id: Mapped[str] = mapped_column(
+        ForeignKey("integration_webhooks.id", ondelete="CASCADE"),
+        index=True,
+    )
+    event_id: Mapped[str] = mapped_column(
+        ForeignKey("control_events.id", ondelete="CASCADE"),
+        index=True,
+    )
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

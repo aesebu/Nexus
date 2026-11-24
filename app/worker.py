@@ -6,7 +6,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
@@ -29,8 +29,12 @@ from app.models import (
     AuditEvent,
     AutomationWorkflowRun,
     AutomationWorkflowRunStatus,
+    ControlEvent,
     ControlTask,
     EmergencyStop,
+    IntegrationWebhook,
+    IntegrationWebhookDelivery,
+    IntegrationWebhookStatus,
     TaskStatus,
     TaskWorkItem,
     WorkItemStatus,
@@ -41,6 +45,13 @@ from app.schemas import (
     InferenceRequest,
     InferenceResponse,
 )
+from app.integrations.webhooks import (
+    WebhookConfigurationError,
+    WebhookTransientError,
+    send_signed_webhook,
+    validate_webhook_destination,
+)
+from app.secrets import SecretNotFoundError, SecretStoreError, resolve_secret
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +75,85 @@ class PermanentWorkError(Exception):
 
 class RetryableWorkError(Exception):
     pass
+
+
+def _execute_webhook_delivery(
+    db: Session,
+    claim: WorkClaim,
+    sender: Callable[..., int],
+) -> dict[str, Any]:
+    delivery_id = claim.payload.get("delivery_id")
+    if not isinstance(delivery_id, str):
+        raise PermanentWorkError("Webhook delivery identifier is invalid")
+    delivery = db.scalar(
+        select(IntegrationWebhookDelivery).where(
+            IntegrationWebhookDelivery.id == delivery_id,
+            IntegrationWebhookDelivery.tenant_id == claim.tenant_id,
+            IntegrationWebhookDelivery.task_id == claim.task_id,
+        )
+    )
+    if delivery is None:
+        raise PermanentWorkError("Webhook delivery was not found")
+    webhook = db.scalar(
+        select(IntegrationWebhook).where(
+            IntegrationWebhook.id == delivery.webhook_id,
+            IntegrationWebhook.tenant_id == claim.tenant_id,
+            IntegrationWebhook.status == IntegrationWebhookStatus.ENABLED,
+        )
+    )
+    if webhook is None:
+        raise PermanentWorkError("Webhook subscription is not enabled")
+    event = db.scalar(
+        select(ControlEvent).where(
+            ControlEvent.id == delivery.event_id,
+            ControlEvent.tenant_id == claim.tenant_id,
+        )
+    )
+    if event is None:
+        raise PermanentWorkError("Webhook event was not found")
+    try:
+        validate_webhook_destination(webhook.target_url)
+    except WebhookConfigurationError as exc:
+        raise PermanentWorkError(str(exc)) from exc
+    try:
+        signing_secret = resolve_secret(
+            db,
+            tenant_id=claim.tenant_id,
+            name=webhook.secret_name,
+        )
+    except (SecretNotFoundError, SecretStoreError) as exc:
+        raise PermanentWorkError("Webhook signing secret is unavailable") from exc
+
+    try:
+        body = json.dumps(
+            {
+                "event_id": event.id,
+                "event_type": event.event_type,
+                "occurred_at": event.created_at.isoformat(),
+                "payload": event.payload,
+            },
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise PermanentWorkError("Webhook event is not JSON-compatible") from exc
+
+    try:
+        response_status = sender(
+            target_url=webhook.target_url,
+            signing_secret=signing_secret,
+            body=body,
+            event_id=event.id,
+            delivery_id=delivery.id,
+        )
+    except WebhookConfigurationError as exc:
+        raise PermanentWorkError(str(exc)) from exc
+    if response_status in {408, 425, 429} or 500 <= response_status <= 599:
+        raise WebhookTransientError("Webhook receiver returned a retryable status")
+    if not 200 <= response_status <= 299:
+        raise PermanentWorkError("Webhook receiver rejected the delivery")
+    return {"status_code": response_status}
 
 
 def _audit(
@@ -495,6 +585,27 @@ def _finish_work_item(
                     detail={"step_count": len(result_value.get("steps", []))},
                 )
             )
+        webhook_delivery = db.scalar(
+            select(IntegrationWebhookDelivery).where(
+                IntegrationWebhookDelivery.task_id == task.id
+            )
+        )
+        if webhook_delivery is not None:
+            db.add(
+                AuditEvent(
+                    tenant_id=webhook_delivery.tenant_id,
+                    actor=worker_id,
+                    action="WEBHOOK_DELIVERY_COMPLETED",
+                    resource_type="IntegrationWebhookDelivery",
+                    resource_id=webhook_delivery.id,
+                    outcome="SUCCESS",
+                    detail={
+                        "webhook_id": webhook_delivery.webhook_id,
+                        "event_id": webhook_delivery.event_id,
+                        "status_code": result_value["status_code"],
+                    },
+                )
+            )
         _audit(
             db,
             task=task,
@@ -512,7 +623,15 @@ def _finish_work_item(
                         "output_tokens": result.output_tokens,
                     }
                     if isinstance(result, InferenceResponse)
-                    else {"step_count": len(result_value.get("steps", []))}
+                    else (
+                        {"step_count": len(result_value.get("steps", []))}
+                        if claim.work_type == "automation.workflow"
+                        else (
+                            {"status_code": result_value["status_code"]}
+                            if claim.work_type == "integration.webhook"
+                            else {}
+                        )
+                    )
                 ),
             },
         )
@@ -555,6 +674,27 @@ def _finish_work_item(
                     detail={"attempt": claim.attempt},
                 )
             )
+        webhook_delivery = db.scalar(
+            select(IntegrationWebhookDelivery).where(
+                IntegrationWebhookDelivery.task_id == task.id
+            )
+        )
+        if webhook_delivery is not None:
+            db.add(
+                AuditEvent(
+                    tenant_id=webhook_delivery.tenant_id,
+                    actor=worker_id,
+                    action="WEBHOOK_DELIVERY_FAILED",
+                    resource_type="IntegrationWebhookDelivery",
+                    resource_id=webhook_delivery.id,
+                    outcome="FAILED",
+                    detail={
+                        "webhook_id": webhook_delivery.webhook_id,
+                        "event_id": webhook_delivery.event_id,
+                        "attempt": claim.attempt,
+                    },
+                )
+            )
         _audit(
             db,
             task=task,
@@ -574,6 +714,7 @@ def process_next_work_item(
     *,
     worker_id: str,
     provider: InferenceProvider | None = None,
+    webhook_sender: Callable[..., int] | None = None,
     now: datetime | None = None,
 ) -> bool:
     claimed_at = now or datetime.now(timezone.utc)
@@ -587,6 +728,12 @@ def process_next_work_item(
             result = _execute_ai_inference(db, claim, active_provider)
         elif claim.work_type == "automation.workflow":
             result = _execute_workflow(db, claim, active_provider)
+        elif claim.work_type == "integration.webhook":
+            result = _execute_webhook_delivery(
+                db,
+                claim,
+                webhook_sender or send_signed_webhook,
+            )
         else:
             raise PermanentWorkError("Unsupported task work type")
     except RetryableWorkError:
@@ -595,6 +742,15 @@ def process_next_work_item(
             claim=claim,
             worker_id=worker_id,
             error="Emergency stop is active",
+            retryable=True,
+            now=datetime.now(timezone.utc),
+        )
+    except WebhookTransientError:
+        _finish_work_item(
+            db,
+            claim=claim,
+            worker_id=worker_id,
+            error="Webhook delivery failed transiently",
             retryable=True,
             now=datetime.now(timezone.utc),
         )

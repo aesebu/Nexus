@@ -26,3 +26,4 @@ jobs:
           rm -f /tmp/nexus-ci.db
           alembic upgrade head
           alembic downgrade base
+          alembic upgrade head

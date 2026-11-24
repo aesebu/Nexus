@@ -998,6 +998,7 @@ def test_event_journal_filters_events_and_validates_enabled_source(client):
     assert event_audit["detail"] == {
         "event_type": "integration.sync.completed",
         "source_system_id": source_id,
+        "webhook_delivery_count": 0,
     }
 
 

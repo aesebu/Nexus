@@ -1,21 +1,33 @@
+x-nexus-environment: &nexus-environment
+  NEXUS_ENVIRONMENT: production
+  NEXUS_DATABASE_URL: postgresql://nexus:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/nexus
+  NEXUS_JWT_SECRET: ${NEXUS_JWT_SECRET:?Set NEXUS_JWT_SECRET}
+  NEXUS_JWT_ISSUER: ${NEXUS_JWT_ISSUER:-nexus}
+  NEXUS_JWT_AUDIENCE: ${NEXUS_JWT_AUDIENCE:-nexus-api}
+  NEXUS_SECRET_ENCRYPTION_KEY: ${NEXUS_SECRET_ENCRYPTION_KEY:?Set NEXUS_SECRET_ENCRYPTION_KEY}
+  NEXUS_AI_BASE_URL: ${NEXUS_AI_BASE_URL:-https://api.openai.com/v1}
+  NEXUS_AI_API_KEY: ${NEXUS_AI_API_KEY:-}
+  NEXUS_INTEGRATION_ALLOWED_HOSTS: ${NEXUS_INTEGRATION_ALLOWED_HOSTS:-}
+
 services:
+  migrate:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    environment: *nexus-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   api:
     build: .
     ports:
       - "8000:8000"
-    command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
-    environment:
-      NEXUS_ENVIRONMENT: production
-      NEXUS_DATABASE_URL: postgresql://nexus:${POSTGRES_PASSWORD}@postgres:5432/nexus
-      NEXUS_JWT_SECRET: ${NEXUS_JWT_SECRET:?Set NEXUS_JWT_SECRET}
-      NEXUS_JWT_ISSUER: ${NEXUS_JWT_ISSUER:-nexus}
-      NEXUS_JWT_AUDIENCE: ${NEXUS_JWT_AUDIENCE:-nexus-api}
-      NEXUS_SECRET_ENCRYPTION_KEY: ${NEXUS_SECRET_ENCRYPTION_KEY:?Set NEXUS_SECRET_ENCRYPTION_KEY}
-      NEXUS_AI_BASE_URL: ${NEXUS_AI_BASE_URL:-https://api.openai.com/v1}
-      NEXUS_AI_API_KEY: ${NEXUS_AI_API_KEY:-}
+    environment: *nexus-environment
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready', timeout=5)\""]
       interval: 10s
@@ -24,23 +36,16 @@ services:
 
   worker:
     build: .
-    command: ["sh", "-c", "alembic upgrade head && python -m app.worker"]
     restart: unless-stopped
-    environment:
-      NEXUS_ENVIRONMENT: production
-      NEXUS_DATABASE_URL: postgresql://nexus:${POSTGRES_PASSWORD}@postgres:5432/nexus
-      NEXUS_JWT_SECRET: ${NEXUS_JWT_SECRET:?Set NEXUS_JWT_SECRET}
-      NEXUS_JWT_ISSUER: ${NEXUS_JWT_ISSUER:-nexus}
-      NEXUS_JWT_AUDIENCE: ${NEXUS_JWT_AUDIENCE:-nexus-api}
-      NEXUS_SECRET_ENCRYPTION_KEY: ${NEXUS_SECRET_ENCRYPTION_KEY:?Set NEXUS_SECRET_ENCRYPTION_KEY}
-      NEXUS_AI_BASE_URL: ${NEXUS_AI_BASE_URL:-https://api.openai.com/v1}
-      NEXUS_AI_API_KEY: ${NEXUS_AI_API_KEY:-}
+    command: ["python", "-m", "app.worker"]
+    environment: *nexus-environment
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_DB: nexus
       POSTGRES_USER: nexus

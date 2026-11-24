@@ -35,6 +35,11 @@ from app.models import (
     KnowledgeDocumentVersion,
     KnowledgeSource,
     KnowledgeSourceStatus,
+    ApplicationRegistration,
+    ApplicationStatus,
+    IntegrationWebhook,
+    IntegrationWebhookDelivery,
+    IntegrationWebhookStatus,
     IntelligenceAssessment,
     AutomationWorkflow,
     AutomationWorkflowRun,
@@ -87,6 +92,13 @@ from app.schemas import (
     KnowledgeSourceCreate,
     KnowledgeSourceResponse,
     KnowledgeSourceUpdate,
+    ApplicationRegistrationCreate,
+    ApplicationRegistrationResponse,
+    ApplicationRegistrationUpdate,
+    IntegrationWebhookCreate,
+    IntegrationWebhookDeliveryResponse,
+    IntegrationWebhookResponse,
+    IntegrationWebhookUpdate,
     DecisionAssessmentCreate,
     DecisionAssessmentListItem,
     DecisionAssessmentResponse,
@@ -124,6 +136,7 @@ from app.schemas import (
 )
 from app.security import require_permission
 from app.secrets import SecretStoreError, encrypt_secret
+from app.integrations.webhooks import WebhookConfigurationError, validate_webhook_destination
 
 router = APIRouter()
 
@@ -608,6 +621,152 @@ def update_system(
     return system
 
 
+@router.post(
+    "/applications",
+    response_model=ApplicationRegistrationResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def register_application(
+    request: ApplicationRegistrationCreate,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.application.manage")),
+) -> ApplicationRegistration:
+    actor, tenant_id = identity
+    application = ApplicationRegistration(
+        tenant_id=tenant_id,
+        app_key=request.app_key,
+        name=request.name,
+        description=request.description,
+        status=request.status,
+        permission_scopes=request.permission_scopes,
+        data_scopes=request.data_scopes,
+        created_by=actor,
+    )
+    try:
+        db.add(application)
+        db.flush()
+        audit(
+            db,
+            tenant_id=tenant_id,
+            actor=actor,
+            action="APPLICATION_REGISTERED",
+            resource_type="ApplicationRegistration",
+            resource_id=application.id,
+            outcome="SUCCESS",
+            detail={
+                "app_key": application.app_key,
+                "status": application.status.value,
+                "permission_scope_count": len(application.permission_scopes),
+                "data_scope_count": len(application.data_scopes),
+            },
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Application key already exists",
+        ) from exc
+    db.refresh(application)
+    return application
+
+
+@router.get(
+    "/applications",
+    response_model=list[ApplicationRegistrationResponse],
+)
+def list_applications(
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.application.read")),
+    application_status: ApplicationStatus | None = Query(
+        default=None,
+        alias="status",
+    ),
+    limit: int = Query(default=100, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> list[ApplicationRegistration]:
+    _actor, tenant_id = identity
+    statement = select(ApplicationRegistration).where(
+        ApplicationRegistration.tenant_id == tenant_id
+    )
+    if application_status is not None:
+        statement = statement.where(
+            ApplicationRegistration.status == application_status
+        )
+    return list(
+        db.scalars(
+            statement.order_by(ApplicationRegistration.app_key.asc())
+            .offset(offset)
+            .limit(limit)
+        )
+    )
+
+
+@router.get(
+    "/applications/{application_id}",
+    response_model=ApplicationRegistrationResponse,
+)
+def get_application(
+    application_id: str,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.application.read")),
+) -> ApplicationRegistration:
+    _actor, tenant_id = identity
+    application = db.scalar(
+        select(ApplicationRegistration).where(
+            ApplicationRegistration.id == application_id,
+            ApplicationRegistration.tenant_id == tenant_id,
+        )
+    )
+    if application is None:
+        raise HTTPException(status_code=404, detail="Application not found")
+    return application
+
+
+@router.patch(
+    "/applications/{application_id}",
+    response_model=ApplicationRegistrationResponse,
+)
+def update_application(
+    application_id: str,
+    request: ApplicationRegistrationUpdate,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.application.manage")),
+) -> ApplicationRegistration:
+    actor, tenant_id = identity
+    application = db.scalar(
+        select(ApplicationRegistration)
+        .where(
+            ApplicationRegistration.id == application_id,
+            ApplicationRegistration.tenant_id == tenant_id,
+        )
+        .with_for_update()
+    )
+    if application is None:
+        raise HTTPException(status_code=404, detail="Application not found")
+
+    updates = request.model_dump(exclude_unset=True)
+    for field, value in updates.items():
+        setattr(application, field, value)
+    audit(
+        db,
+        tenant_id=tenant_id,
+        actor=actor,
+        action="APPLICATION_UPDATED",
+        resource_type="ApplicationRegistration",
+        resource_id=application.id,
+        outcome="SUCCESS",
+        detail={
+            "fields": sorted(updates),
+            "permission_scope_count": len(application.permission_scopes),
+            "data_scope_count": len(application.data_scopes),
+        },
+    )
+    db.commit()
+    db.refresh(application)
+    return application
+
+
 def control_task_for_tenant(
     db: Session,
     *,
@@ -940,6 +1099,60 @@ def publish_event(
     )
     db.add(event)
     db.flush()
+    subscriptions = list(
+        db.scalars(
+            select(IntegrationWebhook).where(
+                IntegrationWebhook.tenant_id == tenant_id,
+                IntegrationWebhook.status == IntegrationWebhookStatus.ENABLED,
+            )
+        )
+    )
+    delivery_count = 0
+    for subscription in subscriptions:
+        if event.event_type not in subscription.event_types:
+            continue
+        task = ControlTask(
+            tenant_id=tenant_id,
+            title=f"Webhook delivery: {subscription.name}",
+            description=f"Delivery for event {event.id}",
+            status=TaskStatus.PENDING,
+            created_by=actor,
+        )
+        db.add(task)
+        db.flush()
+        delivery = IntegrationWebhookDelivery(
+            task_id=task.id,
+            webhook_id=subscription.id,
+            event_id=event.id,
+            tenant_id=tenant_id,
+        )
+        db.add(delivery)
+        db.flush()
+        db.add(
+            TaskWorkItem(
+                task_id=task.id,
+                tenant_id=tenant_id,
+                work_type="integration.webhook",
+                payload={"delivery_id": delivery.id},
+                status=WorkItemStatus.PENDING,
+            )
+        )
+        audit(
+            db,
+            tenant_id=tenant_id,
+            actor=actor,
+            action="WEBHOOK_DELIVERY_QUEUED",
+            resource_type="IntegrationWebhookDelivery",
+            resource_id=delivery.id,
+            outcome="SUCCESS",
+            detail={
+                "webhook_id": subscription.id,
+                "event_id": event.id,
+                "event_type": event.event_type,
+                "task_id": task.id,
+            },
+        )
+        delivery_count += 1
     audit(
         db,
         tenant_id=tenant_id,
@@ -951,11 +1164,257 @@ def publish_event(
         detail={
             "event_type": event.event_type,
             "source_system_id": event.source_system_id,
+            "webhook_delivery_count": delivery_count,
         },
     )
     db.commit()
     db.refresh(event)
     return event
+
+
+@router.post(
+    "/integrations/webhooks",
+    response_model=IntegrationWebhookResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_integration_webhook(
+    request: IntegrationWebhookCreate,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.integration.manage")),
+) -> IntegrationWebhook:
+    actor, tenant_id = identity
+    try:
+        target_host = validate_webhook_destination(request.target_url)[0]
+    except WebhookConfigurationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    secret_exists = db.scalar(
+        select(TenantSecret.id).where(
+            TenantSecret.tenant_id == tenant_id,
+            TenantSecret.name == request.secret_name,
+        )
+    )
+    if secret_exists is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Webhook signing secret must exist in the tenant secret store",
+        )
+    webhook_count = db.scalar(
+        select(func.count())
+        .select_from(IntegrationWebhook)
+        .where(IntegrationWebhook.tenant_id == tenant_id)
+    )
+    if webhook_count is not None and webhook_count >= 100:
+        raise HTTPException(
+            status_code=409,
+            detail="Tenant webhook subscription limit reached",
+        )
+
+    webhook = IntegrationWebhook(
+        tenant_id=tenant_id,
+        name=request.name,
+        target_url=request.target_url,
+        secret_name=request.secret_name,
+        event_types=request.event_types,
+        status=request.status,
+        created_by=actor,
+    )
+    try:
+        db.add(webhook)
+        db.flush()
+        audit(
+            db,
+            tenant_id=tenant_id,
+            actor=actor,
+            action="WEBHOOK_SUBSCRIPTION_CREATED",
+            resource_type="IntegrationWebhook",
+            resource_id=webhook.id,
+            outcome="SUCCESS",
+            detail={
+                "name": webhook.name,
+                "target_host": target_host,
+                "status": webhook.status.value,
+                "event_type_count": len(webhook.event_types),
+            },
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Webhook subscription name already exists",
+        ) from exc
+    db.refresh(webhook)
+    return webhook
+
+
+@router.get(
+    "/integrations/webhooks",
+    response_model=list[IntegrationWebhookResponse],
+)
+def list_integration_webhooks(
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.integration.read")),
+    webhook_status: IntegrationWebhookStatus | None = Query(
+        default=None,
+        alias="status",
+    ),
+    limit: int = Query(default=100, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> list[IntegrationWebhook]:
+    _actor, tenant_id = identity
+    statement = select(IntegrationWebhook).where(
+        IntegrationWebhook.tenant_id == tenant_id
+    )
+    if webhook_status is not None:
+        statement = statement.where(IntegrationWebhook.status == webhook_status)
+    return list(
+        db.scalars(
+            statement.order_by(IntegrationWebhook.name.asc())
+            .offset(offset)
+            .limit(limit)
+        )
+    )
+
+
+@router.get(
+    "/integrations/webhooks/{webhook_id}",
+    response_model=IntegrationWebhookResponse,
+)
+def get_integration_webhook(
+    webhook_id: str,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.integration.read")),
+) -> IntegrationWebhook:
+    _actor, tenant_id = identity
+    webhook = db.scalar(
+        select(IntegrationWebhook).where(
+            IntegrationWebhook.id == webhook_id,
+            IntegrationWebhook.tenant_id == tenant_id,
+        )
+    )
+    if webhook is None:
+        raise HTTPException(status_code=404, detail="Webhook subscription not found")
+    return webhook
+
+
+@router.patch(
+    "/integrations/webhooks/{webhook_id}",
+    response_model=IntegrationWebhookResponse,
+)
+def update_integration_webhook(
+    webhook_id: str,
+    request: IntegrationWebhookUpdate,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.integration.manage")),
+) -> IntegrationWebhook:
+    actor, tenant_id = identity
+    webhook = db.scalar(
+        select(IntegrationWebhook)
+        .where(
+            IntegrationWebhook.id == webhook_id,
+            IntegrationWebhook.tenant_id == tenant_id,
+        )
+        .with_for_update()
+    )
+    if webhook is None:
+        raise HTTPException(status_code=404, detail="Webhook subscription not found")
+
+    updates = request.model_dump(exclude_unset=True)
+    target_url = updates.get("target_url", webhook.target_url)
+    secret_name = updates.get("secret_name", webhook.secret_name)
+    remains_enabled = (
+        updates.get("status", webhook.status) == IntegrationWebhookStatus.ENABLED
+    )
+    target_host: str | None = None
+    if "target_url" in updates or remains_enabled:
+        try:
+            target_host = validate_webhook_destination(target_url)[0]
+        except WebhookConfigurationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if "secret_name" in updates or remains_enabled:
+        secret_exists = db.scalar(
+            select(TenantSecret.id).where(
+                TenantSecret.tenant_id == tenant_id,
+                TenantSecret.name == secret_name,
+            )
+        )
+        if secret_exists is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Webhook signing secret must exist in the tenant secret store",
+            )
+
+    for field, value in updates.items():
+        setattr(webhook, field, value)
+    audit(
+        db,
+        tenant_id=tenant_id,
+        actor=actor,
+        action="WEBHOOK_SUBSCRIPTION_UPDATED",
+        resource_type="IntegrationWebhook",
+        resource_id=webhook.id,
+        outcome="SUCCESS",
+        detail={
+            "fields": sorted(updates),
+            "target_host": target_host,
+            "event_type_count": len(webhook.event_types),
+            "status": webhook.status.value,
+        },
+    )
+    db.commit()
+    db.refresh(webhook)
+    return webhook
+
+
+@router.get(
+    "/integrations/webhooks/{webhook_id}/deliveries",
+    response_model=list[IntegrationWebhookDeliveryResponse],
+)
+def list_integration_webhook_deliveries(
+    webhook_id: str,
+    db: Session = Depends(get_db),
+    identity=Depends(require_permission("nexus.integration.read")),
+    limit: int = Query(default=100, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> list[IntegrationWebhookDeliveryResponse]:
+    _actor, tenant_id = identity
+    webhook_exists = db.scalar(
+        select(IntegrationWebhook.id).where(
+            IntegrationWebhook.id == webhook_id,
+            IntegrationWebhook.tenant_id == tenant_id,
+        )
+    )
+    if webhook_exists is None:
+        raise HTTPException(status_code=404, detail="Webhook subscription not found")
+    rows = db.execute(
+        select(IntegrationWebhookDelivery, ControlTask, TaskWorkItem)
+        .join(ControlTask, ControlTask.id == IntegrationWebhookDelivery.task_id)
+        .join(TaskWorkItem, TaskWorkItem.task_id == ControlTask.id)
+        .where(
+            IntegrationWebhookDelivery.webhook_id == webhook_id,
+            IntegrationWebhookDelivery.tenant_id == tenant_id,
+        )
+        .order_by(
+            IntegrationWebhookDelivery.created_at.desc(),
+            IntegrationWebhookDelivery.id.desc(),
+        )
+        .offset(offset)
+        .limit(limit)
+    )
+    return [
+        IntegrationWebhookDeliveryResponse(
+            id=delivery.id,
+            webhook_id=delivery.webhook_id,
+            event_id=delivery.event_id,
+            task_id=task.id,
+            status=task.status,
+            attempts=work_item.attempts,
+            failure_reason=task.failure_reason,
+            created_at=delivery.created_at,
+            finished_at=task.finished_at,
+        )
+        for delivery, task, work_item in rows
+    ]
 
 
 @router.get("/events", response_model=list[EventResponse])
@@ -1179,6 +1638,18 @@ def delete_secret(
     )
     if secret is None:
         raise HTTPException(status_code=404, detail="Secret not found")
+    active_webhook = db.scalar(
+        select(IntegrationWebhook.id).where(
+            IntegrationWebhook.tenant_id == tenant_id,
+            IntegrationWebhook.secret_name == secret.name,
+            IntegrationWebhook.status == IntegrationWebhookStatus.ENABLED,
+        )
+    )
+    if active_webhook is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Disable webhook subscriptions before deleting their signing secret",
+        )
 
     audit(
         db,

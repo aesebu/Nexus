@@ -39,6 +39,29 @@ def test_production_settings_require_strong_identity_configuration():
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("jwt_issuer", ""),
+        ("jwt_issuer", "   "),
+        ("jwt_audience", ""),
+        ("jwt_audience", "   "),
+    ],
+)
+def test_production_settings_reject_blank_identity_values(field, value):
+    settings_values = {
+        "environment": "production",
+        "jwt_secret": "a" * 32,
+        "jwt_issuer": "nexus",
+        "jwt_audience": "nexus-api",
+        "secret_encryption_key": Fernet.generate_key().decode("ascii"),
+        field: value,
+    }
+
+    with pytest.raises(ValidationError):
+        Settings(**settings_values)
+
+
 def test_production_jwt_requires_exp_issuer_and_audience():
     settings = production_settings()
     dependency = require_permission("nexus.command.read")
