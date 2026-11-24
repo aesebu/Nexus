@@ -7,6 +7,7 @@ from sqlalchemy import (
     CheckConstraint,
     Enum,
     ForeignKey,
+    Index,
     String,
     Text,
     DateTime,
@@ -270,6 +271,26 @@ class TaskWorkItem(Base):
         DateTime(timezone=True), nullable=True, index=True
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class WorkerHeartbeat(Base):
+    __tablename__ = "worker_heartbeats"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('RUNNING', 'STOPPED')",
+            name="ck_worker_heartbeat_status",
+        ),
+        Index(
+            "ix_worker_heartbeats_status_last_seen_at",
+            "status",
+            "last_seen_at",
+        ),
+    )
+
+    worker_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    status: Mapped[str] = mapped_column(String(16))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class ControlEvent(Base):

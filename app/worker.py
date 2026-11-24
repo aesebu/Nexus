@@ -1,11 +1,13 @@
 import json
 import logging
 import os
+import signal
 import socket
 import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from threading import Event
 from typing import Any, Callable
 
 from sqlalchemy import and_, or_, select, update
@@ -52,6 +54,10 @@ from app.integrations.webhooks import (
     validate_webhook_destination,
 )
 from app.secrets import SecretNotFoundError, SecretStoreError, resolve_secret
+from app.worker_monitoring import (
+    WORKER_HEARTBEAT_INTERVAL_SECONDS,
+    record_worker_heartbeat,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -800,24 +806,87 @@ def process_next_work_item(
     return True
 
 
+def initialize_worker_database() -> None:
+    if settings.environment != "production":
+        Base.metadata.create_all(bind=engine)
+
+
 def run_worker() -> None:
-    Base.metadata.create_all(bind=engine)
+    initialize_worker_database()
     worker_id = (
         f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     )[:128]
     logger.info("Task worker started worker_id=%s", worker_id)
-    while True:
+    shutdown = Event()
+
+    def request_shutdown(signum, _frame) -> None:
+        logger.info("Task worker shutdown requested signal=%s", signum)
+        shutdown.set()
+
+    previous_sigint = signal.signal(signal.SIGINT, request_shutdown)
+    previous_sigterm = signal.signal(signal.SIGTERM, request_shutdown)
+    next_heartbeat = 0.0
+    try:
         try:
             with SessionLocal() as db:
-                processed = process_next_work_item(db, worker_id=worker_id)
+                record_worker_heartbeat(
+                    db,
+                    worker_id=worker_id,
+                    status="RUNNING",
+                )
+            next_heartbeat = time.monotonic() + WORKER_HEARTBEAT_INTERVAL_SECONDS
         except SQLAlchemyError as exc:
             logger.error(
-                "Task worker database operation failed error_type=%s",
+                "Task worker heartbeat failed error_type=%s",
                 type(exc).__name__,
             )
-            processed = False
-        if not processed:
-            time.sleep(POLL_INTERVAL_SECONDS)
+
+        while not shutdown.is_set():
+            try:
+                with SessionLocal() as db:
+                    if time.monotonic() >= next_heartbeat:
+                        record_worker_heartbeat(
+                            db,
+                            worker_id=worker_id,
+                            status="RUNNING",
+                        )
+                        next_heartbeat = (
+                            time.monotonic() + WORKER_HEARTBEAT_INTERVAL_SECONDS
+                        )
+                    processed = process_next_work_item(db, worker_id=worker_id)
+                    if time.monotonic() >= next_heartbeat:
+                        record_worker_heartbeat(
+                            db,
+                            worker_id=worker_id,
+                            status="RUNNING",
+                        )
+                        next_heartbeat = (
+                            time.monotonic() + WORKER_HEARTBEAT_INTERVAL_SECONDS
+                        )
+            except SQLAlchemyError as exc:
+                logger.error(
+                    "Task worker database operation failed error_type=%s",
+                    type(exc).__name__,
+                )
+                processed = False
+            if not processed:
+                shutdown.wait(POLL_INTERVAL_SECONDS)
+    finally:
+        shutdown.set()
+        try:
+            with SessionLocal() as db:
+                record_worker_heartbeat(
+                    db,
+                    worker_id=worker_id,
+                    status="STOPPED",
+                )
+        except SQLAlchemyError as exc:
+            logger.error(
+                "Task worker shutdown heartbeat failed error_type=%s",
+                type(exc).__name__,
+            )
+        signal.signal(signal.SIGINT, previous_sigint)
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 if __name__ == "__main__":

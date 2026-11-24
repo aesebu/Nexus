@@ -294,7 +294,7 @@ Security and governance system.
 
 | Core Module | Implemented in MVP | Outstanding |
 |---|---|---|
-| CORE-01: Control Engine | Command lifecycle, system registry, manual task lifecycle, durable AI inference/workflow/webhook worker queue, event journal with signed webhook dispatch, tenant configuration store | Event broker and richer routing, runtime health monitoring, live configuration application |
+| CORE-01: Control Engine | Command lifecycle, system registry, manual task lifecycle, durable AI inference/workflow/webhook worker queue, basic worker heartbeat health probe, event journal with signed webhook dispatch, tenant configuration store | Event broker and richer routing, external dependency health and metrics, live configuration application |
 | CORE-02: AI Engine | OpenAI-compatible inference, persistent tenant/actor-scoped conversations, structured output, tool-call declarations, and human ratings for persisted responses | Automated response evaluation, additional provider adapters |
 | CORE-03: Model Intelligence | Tenant-scoped model registry, deterministic capability routing, and tenant-scoped model feedback aggregates | Model discovery, automated evaluation, monitoring, additional provider adapters |
 | CORE-04: Agent Engine | Tenant-scoped agent registry, lifecycle, explicit invocation, and ordered multi-agent orchestration | Autonomous scheduling, tool execution, agent messaging, and delegated permissions |

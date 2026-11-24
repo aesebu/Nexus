@@ -199,7 +199,9 @@ development startup path may create missing SQLite tables, but production
 startup does not use `create_all()`.
 
 Use `/health/live` for process liveness and `/health/ready` for database
-readiness. `/health` remains available as a compatibility endpoint.
+readiness. `/health/worker` reports a recent worker heartbeat and returns 503
+when no worker is active; `/health` remains available as a compatibility
+endpoint.
 
 Manual tasks continue to use the task lifecycle endpoints. Tasks created with
 `work_type: "ai.inference"`, active automation workflow runs, and webhook
@@ -239,9 +241,11 @@ python -m app.worker
 ```
 
 Docker Compose runs a one-shot migration service after PostgreSQL is healthy,
-then starts the API and worker only if migrations succeed. Application
-containers run as an unprivileged user. Place the API behind a TLS-terminating
-reverse proxy for external access. To enqueue an inference task, post a task with `work_type: "ai.inference"` and
+then starts the API and worker only if migrations succeed. The worker reports
+health through a database heartbeat; the Compose health probe marks it
+unhealthy if no heartbeat arrives for six minutes. Application containers run
+as an unprivileged user. Place the API behind a TLS-terminating reverse proxy
+for external access. To enqueue an inference task, post a task with `work_type: "ai.inference"` and
 `work_payload` matching the `/api/v1/ai/infer` request body. For workflows,
 create and activate one through `/api/v1/workflows`, then queue a run through
 `/api/v1/workflows/{workflow_id}/runs`.

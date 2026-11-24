@@ -16,6 +16,9 @@ processes start and automated checks for the migration lifecycle.
   starts API and worker only after that job succeeds.
 - API readiness checks database connectivity; liveness remains independent of
   database availability.
+- The worker records a database heartbeat, exposes health through
+  `/health/worker`, and has a Docker Compose health probe. Production worker
+  startup relies on the migration job rather than `create_all()`.
 - CI runs compilation and tests and exercises migration upgrade, downgrade,
   and re-upgrade on SQLite.
 - Deployment documentation states required secrets, TLS boundary, worker
@@ -39,6 +42,10 @@ processes start and automated checks for the migration lifecycle.
 - API and worker do not race to apply schema changes during startup.
 - A failed migration prevents the API and worker from starting.
 - The application image does not run as root.
+- The worker heartbeat is refreshed at startup and at least every ten seconds
+  while idle; missing or stopped workers are reported unhealthy.
+- `/health/ready` remains a database-readiness check and does not imply worker
+  health.
 - Required production configuration is validated before serving requests.
 - CI verifies reversible migration history and the complete test suite.
 
@@ -56,7 +63,9 @@ processes start and automated checks for the migration lifecycle.
 - Task and webhook processing is at-least-once. Monitor worker health and
   account for duplicate side effects.
 - Production readiness of the API does not imply that AI providers, workers,
-  webhooks, or external dependencies are healthy.
+  webhooks, or external dependencies are healthy. Query `/health/worker` or
+  inspect the Compose worker health status for worker process liveness; the
+  heartbeat is considered stale after six minutes.
 
 ## Status
 
