@@ -1,0 +1,143 @@
+# knowledge/seed_sources.py
+# field order: id, name, url, api, domains, type, tier, klass, license, freq, access, risk
+
+
+FIELDS = ("id","name","url","api","domains","source_type","tier","klass",
+          "license","update_freq","access_method","security_risk")
+
+
+S = [
+# ── A. มหาวิทยาลัย (S1) ──────────────────────────────────
+("mit-ocw","MIT OCW","https://ocw.mit.edu",None,["eng","math","cs","physics"],"university","S1","mainstream","cc-by-nc-sa","static","http","low"),
+("mit-open","MIT Open Learning","https://openlearning.mit.edu",None,["edu","ai","eng"],"university","S1","mainstream","cc-by-nc-sa","static","http","low"),
+("stanford","Stanford Online","https://online.stanford.edu",None,["ai","cs","biz"],"university","S1","mainstream","proprietary","static","http","low"),
+("harvard","Harvard Online","https://online.harvard.edu",None,["soc","bio","law"],"university","S1","mainstream","proprietary","static","http","low"),
+("yale","Open Yale Courses","https://oyc.yale.edu",None,["phil","law","history"],"university","S1","mainstream","cc-by-nc-sa","static","http","low"),
+("openstax","OpenStax","https://openstax.org",None,["math","physics","econ","bio"],"textbook","S1","mainstream","cc-by","static","http","low"),
+("khan","Khan Academy","https://khanacademy.org",None,["math","physics","econ"],"mooc","S2","mainstream","cc-by-nc-sa","static","http","low"),
+("unesco-oer","UNESCO OER","https://unesco.org/oer",None,["edu"],"university","S1","mainstream","cc-by","static","http","low"),
+
+
+# ── B. งานวิจัย (S1–S2) ──────────────────────────────────
+("arxiv","arXiv","https://arxiv.org","https://export.arxiv.org/api/query",["ai","physics","math","cs","quantum"],"preprint","S1","mainstream","cc-by","daily","api","low"),
+("openalex","OpenAlex","https://openalex.org","https://api.openalex.org",["research"],"index","S1","mainstream","cc0","monthly","api","low"),
+("scholar","Google Scholar","https://scholar.google.com",None,["research"],"index","S2","mainstream","proprietary","daily","http","low"),
+("semanticscholar","Semantic Scholar","https://semanticscholar.org","https://api.semanticscholar.org",["research","ai"],"index","S2","mainstream","cc-by","daily","api","low"),
+("pubmed","PubMed","https://pubmed.ncbi.nlm.nih.gov","https://eutils.ncbi.nlm.nih.gov",["med","bio","pharm"],"index","S1","mainstream","public","daily","api","low"),
+("doaj","DOAJ","https://doaj.org","https://doaj.org/api",["research"],"journal","S2","mainstream","cc0","weekly","api","low"),
+("core","CORE","https://core.ac.uk","https://api.core.ac.uk",["research"],"index","S2","mainstream","cc-by","daily","api","low"),
+("zenodo","Zenodo","https://zenodo.org","https://zenodo.org/api",["research","data"],"repo","S2","mainstream","cc0","daily","api","low"),
+("cern","CERN","https://home.cern","https://opendata.cern.ch/api",["physics","quantum"],"research","S1","mainstream","cc0","static","api","low"),
+("base","BASE","https://base-search.net","https://api.base-search.net",["research"],"index","S1","mainstream","cc-by-nc","weekly","api","low"),
+("openaire","OpenAIRE","https://openaire.eu","https://api.openaire.eu",["research"],"index","S1","mainstream","cc-by","weekly","api","low"),
+("doab","DOAB","https://doabooks.org","https://doabooks.org/api",["research","art"],"book","S2","mainstream","cc-by","weekly","api","low"),
+("oatd","OATD","https://oatd.org",None,["research"],"thesis","S2","mainstream","cc-by-nc","weekly","http","low"),
+("lens","The Lens","https://lens.org","https://api.lens.org",["research","law"],"patent","S2","mainstream","proprietary","weekly","api","low"),
+("datacite","DataCite","https://datacite.org","https://api.datacite.org",["data","research"],"index","S1","mainstream","cc0","daily","api","low"),
+("re3data","re3data","https://re3data.org","https://api.re3data.org",["data"],"directory","S2","mainstream","cc-by","weekly","api","low"),
+("preprints","Preprints.org","https://preprints.org",None,["research"],"preprint","S4","alternative","cc-by","daily","http","low"),
+
+
+# ── C. AI / เทคโนโลยี (S1–S3) ────────────────────────────
+("hf","Hugging Face","https://huggingface.co","https://huggingface.co/api",["ai"],"vendor","S3","mainstream","mixed","daily","api","low"),
+("github","GitHub","https://github.com","https://api.github.com",["cs","se","ai"],"vendor","S3","mainstream","mixed","daily","api","low"),
+("googleres","Google Research","https://research.google",None,["ai","cs","quantum"],"corp","S2","mainstream","proprietary","weekly","http","low"),
+("msr","Microsoft Research","https://microsoft.com/research",None,["ai","cs","quantum"],"corp","S2","mainstream","proprietary","weekly","http","low"),
+("openai","OpenAI Research","https://openai.com/research",None,["ai"],"corp","S2","mainstream","proprietary","weekly","http","low"),
+("deepmind","DeepMind","https://deepmind.google",None,["ai","neuro"],"corp","S2","mainstream","proprietary","weekly","http","low"),
+("pytorch","PyTorch","https://pytorch.org",None,["ai","se"],"vendor","S3","mainstream","bsd","weekly","http","low"),
+("tensorflow","TensorFlow","https://tensorflow.org",None,["ai","se"],"vendor","S3","mainstream","apache-2","weekly","http","low"),
+("nvidia","NVIDIA Developer","https://developer.nvidia.com",None,["ai","mat","quantum"],"vendor","S3","mainstream","proprietary","weekly","http","low"),
+("nist","NIST","https://nist.gov","https://services.nvd.nist.gov",["cyber","ai","mat"],"gov","S1","mainstream","public","daily","api","low"),
+("wikidata","Wikidata","https://wikidata.org","https://query.wikidata.org",["keng","research"],"kg","S3","mainstream","cc0","daily","api","low"),
+("wikipedia","Wikipedia","https://wikipedia.org","https://api.wikimedia.org",["keng"],"encyclopedia","S5","mainstream","cc-by-sa","daily","api","low"),
+
+
+# ── D. องค์กรโลก (S1) ───────────────────────────────────
+("nasa","NASA","https://nasa.gov","https://api.nasa.gov",["astronomy","eng","physics"],"gov","S1","mainstream","public","daily","api","low"),
+("who","WHO","https://who.int","https://ghoapi.azureedge.net",["med"],"gov","S1","mainstream","cc-by-nc-sa","weekly","api","low"),
+("fao","FAO","https://fao.org","https://fenixservices.fao.org",["agri","eco"],"gov","S1","mainstream","cc-by-nc-sa","weekly","api","low"),
+("worldbank","World Bank","https://worldbank.org","https://api.worldbank.org",["econ","soc"],"gov","S1","mainstream","cc-by","weekly","api","low"),
+("imf","IMF","https://imf.org","https://api.imf.org",["econ"],"gov","S1","mainstream","cc-by-nc","weekly","api","low"),
+("oecd","OECD","https://oecd.org","https://api.oecd.org",["econ","soc","pol"],"gov","S1","mainstream","cc-by","weekly","api","low"),
+("wipo","WIPO","https://wipo.int","https://api.wipo.int",["law","biz"],"gov","S1","mainstream","cc-by","weekly","api","low"),
+("ilo","ILO","https://ilo.org","https://api.ilo.org",["biz","soc"],"gov","S1","mainstream","cc-by","weekly","api","low"),
+("unep","UN Environment","https://unep.org","https://api.unep.org",["eco","energy"],"gov","S1","mainstream","cc-by","weekly","api","low"),
+("unhcr","UNHCR","https://unhcr.org","https://api.unhcr.org",["soc","pol"],"gov","S1","mainstream","cc-by","weekly","api","low"),
+
+
+# ── E. ประเทศไทย (S1–S2) ────────────────────────────────
+("tnrr","TNRR/NRIIS","https://tnrr.nriis.go.th",None,["research"],"gov","S1","mainstream","public","weekly","http","low"),
+("nrct","สำนักงานการวิจัยแห่งชาติ","https://nrct.go.th",None,["research"],"gov","S1","mainstream","public","weekly","http","low"),
+("nstda","NSTDA","https://nstda.or.th",None,["ai","bio","mat"],"gov","S1","mainstream","public","weekly","http","low"),
+("thaijo","ThaiJO","https://thaijo.org",None,["research"],"journal","S2","mainstream","cc-by","weekly","http","low"),
+("nso","สำนักงานสถิติแห่งชาติ","https://nsomaps.nso.go.th",None,["data","soc"],"gov","S1","mainstream","public","monthly","http","low"),
+("bot","ธนาคารแห่งประเทศไทย","https://bot.or.th","https://api.bot.or.th",["econ","biz"],"gov","S1","mainstream","public","daily","api","low"),
+("nesdc","สภาพัฒน์","https://nesdc.go.th",None,["econ","soc"],"gov","S1","mainstream","public","weekly","http","low"),
+("dpt","กรมโยธาธิการและผังเมือง","https://dpt.go.th",None,["arch","eng"],"gov","S1","mainstream","public","monthly","http","low"),
+("dsd","กรมพัฒนาฝีมือแรงงาน","https://dsd.go.th",None,["edu","biz"],"gov","S1","mainstream","public","monthly","http","low"),
+
+
+# ── F. มาตรฐานวิศวกรรม (S2) ────────────────────────────
+("asce","ASCE","https://asce.org",None,["eng","arch"],"standards","S2","mainstream","proprietary","monthly","http","low"),
+("astm","ASTM International","https://astm.org",None,["mat","eng"],"standards","S2","mainstream","proprietary","monthly","http","low"),
+("aisc","AISC","https://aisc.org",None,["eng"],"standards","S2","mainstream","proprietary","monthly","http","low"),
+("ieee","IEEE","https://ieee.org","https://ieeexploreapi.ieee.org",["eng","telecom","cs"],"standards","S2","mainstream","proprietary","weekly","api","low"),
+("iso","ISO","https://iso.org",None,["eng","law"],"standards","S2","mainstream","proprietary","monthly","http","low"),
+("nfpa","NFPA","https://nfpa.org",None,["eng","energy"],"standards","S2","mainstream","proprietary","monthly","http","low"),
+("osha","OSHA","https://osha.gov","https://api.osha.gov",["eng","med"],"gov","S1","mainstream","public","monthly","api","low"),
+
+
+# ── G. คลังข้อมูล (S1–S2) ──────────────────────────────
+("dataverse","Harvard Dataverse","https://dataverse.harvard.edu","https://dataverse.harvard.edu/api",["data","soc"],"repo","S1","mainstream","cc0","daily","api","low"),
+("dryad","Dryad","https://datadryad.org","https://api.datadryad.org",["data","bio"],"repo","S2","mainstream","cc0","weekly","api","low"),
+("figshare","Figshare","https://figshare.com","https://api.figshare.com",["data","art"],"repo","S2","mainstream","cc-by","daily","api","low"),
+("icpsr","ICPSR","https://icpsr.umich.edu",None,["soc","psych","data"],"repo","S1","mainstream","mixed","weekly","http","low"),
+("gbif","GBIF","https://gbif.org","https://api.gbif.org",["bio","eco"],"repo","S1","mainstream","cc-by","daily","api","low"),
+("genbank","GenBank","https://ncbi.nlm.nih.gov/genbank","https://eutils.ncbi.nlm.nih.gov",["bio","med"],"repo","S1","mainstream","public","daily","api","low"),
+("dataone","DataONE","https://dataone.org","https://api.dataone.org",["eco","data"],"repo","S1","mainstream","cc0","weekly","api","low"),
+("hdx","HDX","https://data.humdata.org","https://data.humdata.org/api",["soc","geo"],"repo","S1","mainstream","cc-by","daily","api","low"),
+("osm","OpenStreetMap","https://openstreetmap.org","https://api.openstreetmap.org",["geo","trans"],"repo","S3","mainstream","odbl","daily","api","low"),
+
+
+# ── H. ประวัติศาสตร์/มรดก (S2–S3) ──────────────────────
+("perseus","Perseus Digital Library","https://perseus.tufts.edu",None,["history","phil","ling"],"archive","S2","mainstream","cc-by-sa","static","http","low"),
+("internetarchive","Internet Archive","https://archive.org","https://archive.org/advancedsearch.php",["history","media","research"],"archive","S2","alternative","mixed","daily","api","low"),
+("dpla","DPLA","https://dp.la","https://api.dp.la",["history","art"],"archive","S2","mainstream","cc0","weekly","api","low"),
+("europeana","Europeana","https://europeana.eu","https://api.europeana.eu",["history","art"],"archive","S2","mainstream","cc0","weekly","api","low"),
+("gallica","Gallica","https://gallica.bnf.fr","https://gallica.bnf.fr/api",["history","ling"],"archive","S2","mainstream","public","static","api","low"),
+("loc","Library of Congress","https://loc.gov","https://loc.gov/api",["history","geo","media"],"archive","S1","mainstream","public","weekly","api","low"),
+("gutenberg","Project Gutenberg","https://gutenberg.org","https://gutendex.com",["ling","art","rel"],"archive","S2","mainstream","public","static","api","low"),
+("hathitrust","HathiTrust","https://hathitrust.org","https://babel.hathitrust.org/api",["history","ling"],"archive","S2","mainstream","mixed","static","api","low"),
+("worldcat","WorldCat","https://worldcat.org","https://api.oclc.org",["research","keng"],"index","S2","mainstream","proprietary","weekly","api","low"),
+
+
+# ── I. นอกกระแส (S4–S5) ────────────────────────────────
+("osf","OSF","https://osf.io","https://api.osf.io",["research","psych"],"repo","S2","alternative","cc0","daily","api","low"),
+("commoncrawl","Common Crawl","https://commoncrawl.org","https://index.commoncrawl.org",["data","ling"],"crawl","S4","alternative","cc0","monthly","api","low"),
+("gpatents","Google Patents","https://patents.google.com","https://patents.google.com/api",["law","eng"],"patent","S3","alternative","public","weekly","api","low"),
+("hn","Hacker News","https://news.ycombinator.com","https://hn.algolia.com/api",["cs","biz"],"forum","S5","alternative","public","daily","api","low"),
+("reddit","Reddit","https://reddit.com","https://api.reddit.com",["media","soc"],"forum","S5","alternative","public","daily","api","low"),
+("lesswrong","LessWrong","https://lesswrong.com","https://lesswrong.com/graphql",["phil","ai"],"forum","S5","alternative","cc-by","weekly","api","low"),
+("lobsters","Lobsters","https://lobste.rs","https://lobste.rs/rss",["cs","se"],"forum","S5","alternative","public","daily","http","low"),
+("policycommons","Policy Commons","https://policycommons.net",None,["pol","law"],"archive","S4","alternative","proprietary","weekly","http","low"),
+("usenet","Usenet Archives","https://archive.org/details/usenet","https://archive.org/advancedsearch.php",["history","cs"],"archive","S5","alternative","public","static","api","low"),
+("stackex","Stack Exchange","https://stackexchange.com","https://api.stackexchange.com",["cs","se"],"forum","S5","alternative","cc-by-sa","daily","api","low"),
+
+
+# ── J. Threat Intelligence (S1–S3) ─────────────────────
+("mitre","MITRE ATT&CK","https://attack.mitre.org","https://raw.githubusercontent.com/mitre/cti",["cyber","intel"],"framework","S1","threat_intel","public","monthly","api","low"),
+("misp","MISP","https://misp-project.org","https://api.misp-project.org",["cyber","intel"],"platform","S3","threat_intel","agpl","daily","api","medium"),
+("otx","AlienVault OTX","https://otx.alienvault.com","https://otx.alienvault.com/api",["cyber","intel"],"feed","S3","threat_intel","mixed","daily","api","medium"),
+("abusech","abuse.ch","https://abuse.ch","https://urlhaus-api.abuse.ch",["cyber","intel"],"feed","S3","threat_intel","public","daily","api","medium"),
+("malwarebazaar","MalwareBazaar","https://bazaar.abuse.ch","https://mb-api.abuse.ch",["cyber"],"feed","S3","threat_intel","public","daily","api","high"),
+("cisa","CISA","https://cisa.gov","https://www.cisa.gov/api",["cyber","pol"],"gov","S1","threat_intel","public","daily","api","low"),
+("virustotal","VirusTotal","https://virustotal.com","https://www.virustotal.com/api",["cyber","intel"],"feed","S3","threat_intel","proprietary","daily","api","medium"),
+
+
+# ── K. Dark Web (S5, readonly, high risk) ──────────────
+("ahmia","Ahmia","https://ahmia.fi",None,["intel"],"search","S5","darkweb","public","daily","tor","high"),
+("tor","Tor Project","https://torproject.org",None,["cyber","intel"],"network","S5","darkweb","public","static","tor","high"),
+("securedrop","SecureDrop","https://securedrop.org",None,["media","intel"],"tool","S5","darkweb","agpl","static","tor","high"),
+("onionshare","OnionShare","https://onionshare.org",None,["cyber"],"tool","S5","darkweb","gpl","static","tor","high"),
+]
